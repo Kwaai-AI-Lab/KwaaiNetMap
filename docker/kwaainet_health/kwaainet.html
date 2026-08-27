@@ -12,7 +12,8 @@
     <!-- Add vis.js for Network Topology -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/vis/4.21.0/vis.min.js"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/vis/4.21.0/vis.min.css" />
-    
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" />
+
     <style>
         body {
             font-family: Arial, sans-serif;
@@ -217,7 +218,78 @@
         .control-actions button:hover {
             background-color: #e9e9e9;
         }
-        
+
+        /* Make the peer-ID cell a positioning context so the copy button
+           can sit absolutely inside it without affecting row height.
+           The extra right-padding reserves space for the absolute button
+           so the cell's auto width includes it and the ID text never
+           overlaps with the icon. */
+        .data-table td.peer-id-cell {
+            position: relative;
+            padding-right: 24px;
+        }
+        .peer-id-copy {
+            /* The button is positioned absolutely so it doesn't influence
+               the row's line-box height. Without this, FA's icon glyph
+               metrics (or even just the <button>'s default inline-block
+               line box) push the row ~9px taller than data-only rows.
+               We pin it to the right of the cell padding-end and centre
+               it vertically. */
+            position: absolute;
+            top: 50%;
+            right: 12px;
+            transform: translateY(-50%);
+            /* Milligram (loaded earlier in this file) styles every <button>
+               with a 3.8rem-tall purple pill. We undo all of that
+               explicitly: height, padding, border-radius, text-transform,
+               letter-spacing, font-weight, white-space — missing any one
+               leaves a visible artefact. */
+            height: auto;
+            padding: 0;
+            -webkit-appearance: none;
+            appearance: none;
+            background: transparent;
+            border: 0;
+            border-radius: 0;
+            cursor: pointer;
+            color: #888;
+            font-size: inherit;
+            font-weight: inherit;
+            letter-spacing: normal;
+            text-transform: none;
+            white-space: normal;
+            line-height: 1;
+            /* Reserve space but stay invisible until the row is hovered so
+               the icon doesn't clutter the table at rest. Keep visible
+               while focused (keyboard nav) or while showing the
+               post-click feedback. */
+            opacity: 0;
+            transition: opacity 0.1s ease-in-out;
+        }
+        /* Suppress milligram's button:hover purple-on-grey wash for our
+           copy button — only the icon colour should change. */
+        .peer-id-copy:focus, .peer-id-copy:hover {
+            background-color: transparent;
+            border-color: transparent;
+            outline: 0;
+        }
+        /* Font Awesome's <i> defaults to display:inline-block, which
+           establishes its own line box with FA's glyph metrics — that
+           pushed peer-ID rows ~2px taller than data-only rows. Override
+           via FA's --fa-display custom property (and a direct rule for
+           safety) so the icon participates in the surrounding text's
+           line box like a normal inline glyph. */
+        .peer-id-copy { --fa-display: inline; }
+        .peer-id-copy i { display: inline; }
+        .data-table tr:hover .peer-id-copy,
+        .peer-id-copy:focus,
+        .peer-id-copy.copied { opacity: 1; }
+        .peer-id-copy:hover { color: #333; }
+        .peer-id-copy.copied { color: #28a745; }
+        /* Suppress the upstream row-hover grey wash — the only thing that
+           should change on row hover is the copy icon fading in. */
+        .data-table tr:hover { background-color: inherit; }
+
         /* Custom table styling */
         .data-table {
             width: 100%;
@@ -415,6 +487,7 @@
                             <th data-sort="state">Status <span class="sort-indicator"></span></th>
                             <th data-sort="location">Location <span class="sort-indicator"></span></th>
                             <th data-sort="publicName">Public Name <span class="sort-indicator"></span></th>
+                            <th data-sort="peerId">Peer ID <span class="sort-indicator"></span></th>
                             <th data-sort="blocks">Blocks <span class="sort-indicator"></span></th>
                             <th data-sort="connectionType">Connection Type <span class="sort-indicator"></span></th>
                             <th data-sort="throughput">Throughput (tok/sec) <span class="sort-indicator"></span></th>
@@ -905,7 +978,7 @@
             if (pageData.length === 0) {
                 const row = document.createElement('tr');
                 const cell = document.createElement('td');
-                cell.colSpan = 7; // Updated column count
+                cell.colSpan = 8; // Updated column count
                 cell.textContent = 'No data found';
                 cell.style.textAlign = 'center';
                 row.appendChild(cell);
@@ -935,7 +1008,70 @@
                 const publicNameCell = document.createElement('td');
                 publicNameCell.textContent = rowData.publicName;
                 row.appendChild(publicNameCell);
-                
+
+                // Peer ID (abbreviated, full ID in tooltip, with copy button)
+                const peerIdCell = document.createElement('td');
+                peerIdCell.className = 'peer-id-cell';
+                const fullPeerId = rowData.peerId || '';
+                const peerIdText = document.createElement('span');
+                if (fullPeerId && fullPeerId.length > 16) {
+                    peerIdText.textContent = fullPeerId.slice(0, 12) + '…' + fullPeerId.slice(-4);
+                } else {
+                    peerIdText.textContent = fullPeerId || 'N/A';
+                }
+                if (fullPeerId) {
+                    peerIdText.title = fullPeerId;
+                }
+                // The `, monospace` repetition is a standard hack: with a
+                // single `monospace`, browsers shrink the rendered size to
+                // match a quirky old-school metric — adding any second
+                // family (even monospace itself) suppresses that, so the
+                // peer-ID text stays at the cell's actual font-size and
+                // sits on the same baseline as the adjacent Arial cells.
+                peerIdText.style.fontFamily = 'monospace, monospace';
+                peerIdCell.appendChild(peerIdText);
+                if (fullPeerId) {
+                    // Font Awesome icons: clipboard for idle, check for success.
+                    const ICON_COPY = '<i class="fa-regular fa-copy"></i>';
+                    const ICON_CHECK = '<i class="fa-solid fa-check"></i>';
+                    const copyBtn = document.createElement('button');
+                    copyBtn.type = 'button';
+                    copyBtn.className = 'peer-id-copy';
+                    copyBtn.innerHTML = ICON_COPY;
+                    copyBtn.title = 'Copy full peer ID';
+                    copyBtn.setAttribute('aria-label', 'Copy peer ID');
+                    copyBtn.addEventListener('click', (ev) => {
+                        ev.stopPropagation();
+                        const restore = () => {
+                            copyBtn.innerHTML = ICON_COPY;
+                            copyBtn.classList.remove('copied');
+                            copyBtn.title = 'Copy full peer ID';
+                        };
+                        const showCopied = () => {
+                            copyBtn.innerHTML = ICON_CHECK;
+                            copyBtn.classList.add('copied');
+                            copyBtn.title = 'Copied';
+                            setTimeout(restore, 1200);
+                        };
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                            navigator.clipboard.writeText(fullPeerId).then(showCopied, restore);
+                        } else {
+                            const ta = document.createElement('textarea');
+                            ta.value = fullPeerId;
+                            ta.setAttribute('readonly', '');
+                            ta.style.position = 'absolute';
+                            ta.style.left = '-9999px';
+                            document.body.appendChild(ta);
+                            ta.select();
+                            try { document.execCommand('copy'); showCopied(); }
+                            catch (e) { restore(); }
+                            document.body.removeChild(ta);
+                        }
+                    });
+                    peerIdCell.appendChild(copyBtn);
+                }
+                row.appendChild(peerIdCell);
+
                 // Blocks
                 const blocksCell = document.createElement('td');
                 blocksCell.textContent = rowData.blocks;
@@ -1326,6 +1462,7 @@
                         model: report.name,
                         location: locationInfo,
                         publicName: publicName,
+                        peerId: server.peer_id || "",
                         blocks: blocks,
                         throughput: throughput ? throughput.toFixed(2) : "N/A",
                         state: server.state,
