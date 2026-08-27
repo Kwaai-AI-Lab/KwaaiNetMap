@@ -62,6 +62,10 @@ def get_location(ip_address):
     return {}
 
 def extract_peer_ip_info(multiaddr_str):
+    # Relay circuit addresses contain the relay's IP, not the peer's.
+    # Return a sentinel location to avoid attributing the relay's geo to the peer.
+    if "/p2p-circuit" in multiaddr_str:
+        return {"status": "success", "country": "Unknown", "city": "Via relay", "lat": 0, "lon": 0, "isp": "Relay"}
     if ip_match := re.search(r"/ip4/(\d+\.\d+\.\d+\.\d+)", multiaddr_str):
         return get_location(ip_match[1])
     return {}
