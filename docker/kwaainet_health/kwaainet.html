@@ -735,8 +735,19 @@
         }
 
         // Helper function to get connection type
+        // Derived from the peer's advertised multiaddrs so it stays consistent
+        // with the Location column (which uses the same multiaddr signal). The
+        // node-self-reported `using_relay` field is computed from config-time
+        // intent rather than runtime reachability, so it can lie — a NATed peer
+        // with any `announce_addr` configured will still report `using_relay:
+        // false` even when its only published address is a /p2p-circuit/.
         function getConnectionType(server) {
+            const addrs = server.peer_ip_info && server.peer_ip_info.multiaddrs;
+            if (Array.isArray(addrs) && addrs.length > 0) {
+                return addrs.some(a => typeof a === 'string' && a.includes('/p2p-circuit')) ? "Relay" : "Direct";
+            }
             if (server.span && server.span.server_info) {
+                // Fallback: trust the node's self-report when no multiaddrs are visible.
                 return server.span.server_info.using_relay ? "Relay" : "Direct";
             }
             return "Unknown";
