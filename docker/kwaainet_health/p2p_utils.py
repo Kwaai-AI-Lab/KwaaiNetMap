@@ -30,7 +30,7 @@ async def check_reachability(peer_id, _, node, *, fetch_info=False, connect_time
         # Actual connection error
         if not isinstance(e, asyncio.TimeoutError):
             message = str(e) if str(e) else repr(e)
-            if message == "protocol not supported":
+            if "protocol" in message and "not supported" in message:
                 # This may be returned when a server is joining, see https://github.com/petals-infra/health.petals.dev/issues/1
                 return {"ok": True}
         else:
