@@ -57,8 +57,9 @@ RUN pip install --no-cache-dir --no-build-isolation -r requirements.txt
 
 # Copy entrypoint script
 COPY docker/kwaainet_health/entrypoint.sh /app/entrypoint.sh
-# Patch p2p utils for async timeout call.
+# Patches over upstream health.petals.dev (see kwaaiai patches/OpenAI-Petal/).
 COPY docker/kwaainet_health/p2p_utils.py /app/health_service/p2p_utils.py
+COPY docker/kwaainet_health/data_structures.py /app/health_service/data_structures.py
 COPY docker/kwaainet_health/kwaainet.html /app/health_service/templates/index.html
 
 # Ensure script is executable
