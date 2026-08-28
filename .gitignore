@@ -1,2 +1,7 @@
 __pycache__/
 *.py[cod]
+
+# map-v2
+map-server/target/
+apps/map/node_modules/
+apps/map/dist/

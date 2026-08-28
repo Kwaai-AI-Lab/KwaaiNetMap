@@ -1,0 +1,25 @@
+# map-server — the Rust map API.
+#
+# Build context is the repo root:
+#   docker build -f Dockerfile.map-server -t kwaainetmap-server .
+FROM rust:slim AS builder
+WORKDIR /src
+
+# protoc for kwaai-p2p-daemon's build script; it would otherwise download one.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      pkg-config libssl-dev protobuf-compiler git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY map-server/ ./map-server/
+WORKDIR /src/map-server
+RUN cargo build --release
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /src/map-server/target/release/map-server /usr/local/bin/map-server
+
+ENV BIND_ADDR=0.0.0.0:3030
+ENV RUST_LOG=map_server=info,tower_http=info
+EXPOSE 3030
+CMD ["map-server"]

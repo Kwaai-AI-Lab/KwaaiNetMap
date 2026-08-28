@@ -1,0 +1,57 @@
+[package]
+name = "map-server"
+version = "0.6.2"
+edition = "2021"
+authors = ["Kwaai AI Lab <dev@kwaai.ai>"]
+license = "MIT"
+repository = "https://github.com/Kwaai-AI-Lab/KwaaiNetMap"
+description = "KwaaiNet map API — DHT crawler, live stats, and WebSocket stream"
+publish = false
+
+[[bin]]
+name = "map-server"
+path = "src/main.rs"
+
+# The three kwaai crates come from crates.io rather than the KwaaiNet
+# workspace. They are published at the same version this crate was extracted
+# at; bump all three together.
+[dependencies]
+kwaai-hivemind-dht = "0.6.2"
+kwaai-p2p = "0.6.2"
+kwaai-p2p-daemon = "0.6.2"
+
+# Web framework
+axum = { version = "0.7", features = ["macros", "ws"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+futures = "0.3"
+
+# DHT / P2P
+libp2p = { version = "0.56", features = ["tokio", "kad", "identify", "noise", "tcp", "yamux", "macros", "request-response", "rsa", "relay", "autonat", "dcutr", "upnp"] }
+prost = "0.12"
+sha1 = "0.10"
+rmp-serde = "1.1"
+rmpv = "1.0"
+hex = "0.4"
+bs58 = "0.5"
+
+# In-memory cache with concurrent access
+dashmap = "5"
+
+# Serialisation
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
