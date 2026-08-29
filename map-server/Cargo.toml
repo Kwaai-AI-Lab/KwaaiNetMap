@@ -12,13 +12,15 @@ publish = false
 name = "map-server"
 path = "src/main.rs"
 
-# The three kwaai crates come from crates.io rather than the KwaaiNet
-# workspace. They are published at the same version this crate was extracted
-# at; bump all three together.
+# From crates.io rather than the KwaaiNet workspace; bump the pair together.
+#
+# `kwaai-p2p` is rust-libp2p: the swarm runs in this process. Deliberately NOT
+# `kwaai-p2p-daemon` — that crate wraps the standalone Go libp2p daemon, which
+# KwaaiNet has replaced, and its build script needs a Go toolchain to compile
+# the Go binary. Nothing here speaks the p2pd control protocol.
 [dependencies]
-kwaai-hivemind-dht = "0.6.2"
-kwaai-p2p = "0.6.2"
-kwaai-p2p-daemon = "0.6.2"
+kwaai-hivemind-dht = "0.6.3"
+kwaai-p2p = "0.6.3"
 
 # Web framework
 axum = { version = "0.7", features = ["macros", "ws"] }
@@ -30,19 +32,26 @@ tokio = { version = "1.35", features = ["full"] }
 futures = "0.3"
 
 # DHT / P2P
-libp2p = { version = "0.56", features = ["tokio", "kad", "identify", "noise", "tcp", "yamux", "macros", "request-response", "rsa", "relay", "autonat", "dcutr", "upnp"] }
+# Only for generating the observer's keypair — kwaai-p2p re-exports PeerId and
+# Multiaddr, and brings the transport/behaviour features the swarm needs.
+libp2p = { version = "0.56", features = ["ed25519"] }
 prost = "0.12"
 sha1 = "0.10"
 rmp-serde = "1.1"
-rmpv = "1.0"
+rmpv = { version = "1.0", features = ["with-serde"] }
 hex = "0.4"
 bs58 = "0.5"
 
 # In-memory cache with concurrent access
 dashmap = "5"
 
+# Geolocation lookups. rustls rather than the system OpenSSL: it keeps the
+# runtime image to a plain debian-slim with no libssl to track.
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+
 # Serialisation
-serde = { version = "1.0", features = ["derive"] }
+# `rc` lets a handler serialise an Arc<Snapshot> without cloning the document.
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 
 # Error handling

@@ -1,0 +1,15 @@
+# map-spa — the React landing page (hero stats, benchmark, trust graph,
+# install funnel). Buildable but NOT deployed: the map that replaces v1 has
+# to carry v1's map/table/topology views, which this page does not have.
+# See V2.md.
+FROM node:20-slim AS builder
+WORKDIR /app
+COPY apps/map/package.json apps/map/package-lock.json* ./
+RUN npm install
+COPY apps/map/ ./
+RUN npm run build
+
+FROM nginx:alpine
+COPY --from=builder /app/dist /usr/share/nginx/html
+COPY docker/map-nginx.conf /etc/nginx/conf.d/default.conf
+EXPOSE 80

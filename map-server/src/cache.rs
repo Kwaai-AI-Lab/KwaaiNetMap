@@ -1,11 +1,18 @@
-//! In-memory node cache with TTL eviction.
+//! The served state: one crawl snapshot, replaced wholesale each pass.
+//!
+//! v1 of this crate accumulated peers into a map with TTL eviction. A snapshot
+//! is a better fit now the API is per model: a peer that stops serving a block
+//! disappears from that model's report on the next crawl, rather than lingering
+//! until its TTL runs out and reporting coverage the network no longer has.
+
+use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
-/// A single peer's info snapshot from the DHT.
+use crate::snapshot::Snapshot;
+
+/// A peer flattened out of the snapshot, for the v2 endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeEntry {
     pub peer_id: String,
@@ -28,59 +35,87 @@ impl NodeEntry {
 }
 
 pub struct NodeCache {
-    inner: Arc<DashMap<String, NodeEntry>>,
-    ttl_secs: u64,
+    snapshot: RwLock<Arc<Snapshot>>,
+    nodes: RwLock<Arc<Vec<NodeEntry>>>,
+}
+
+impl Default for NodeCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl NodeCache {
-    pub fn new(ttl_secs: u64) -> Self {
+    pub fn new() -> Self {
         Self {
-            inner: Arc::new(DashMap::new()),
-            ttl_secs,
+            snapshot: RwLock::new(Arc::new(Snapshot::default())),
+            nodes: RwLock::new(Arc::new(Vec::new())),
         }
     }
 
-    pub fn upsert(&self, entry: NodeEntry) {
-        self.inner.insert(entry.peer_id.clone(), entry);
+    /// Install a fresh crawl. The flat node list is derived once here rather
+    /// than per request, so `/api/nodes` is a clone of an `Arc`.
+    pub fn replace(&self, snapshot: Snapshot) {
+        let derived = crate::crawler::node_entries(&snapshot);
+        *self.snapshot.write().expect("snapshot lock") = Arc::new(snapshot);
+        *self.nodes.write().expect("nodes lock") = Arc::new(derived);
     }
 
-    /// Evict entries older than TTL and return the remaining snapshot.
-    pub fn snapshot(&self) -> Vec<NodeEntry> {
-        let cutoff = Utc::now() - chrono::Duration::seconds(self.ttl_secs as i64);
-        // Remove stale entries
-        self.inner.retain(|_, v| v.last_seen > cutoff);
-        self.inner.iter().map(|r| r.value().clone()).collect()
+    pub fn snapshot(&self) -> Arc<Snapshot> {
+        Arc::clone(&self.snapshot.read().expect("snapshot lock"))
     }
 
-    /// Aggregate stats from current (non-stale) snapshot.
-    pub fn stats(&self, total_blocks: usize) -> NetworkStats {
-        let nodes = self.snapshot();
-        let node_count = nodes.len();
-        let tokens_per_sec: f64 = nodes.iter().map(|n| n.throughput).sum();
-        let active_sessions = nodes.iter().filter(|n| n.is_active()).count();
+    pub fn nodes(&self) -> Arc<Vec<NodeEntry>> {
+        Arc::clone(&self.nodes.read().expect("nodes lock"))
+    }
 
-        // Build coverage bitmap
-        let mut covered = vec![false; total_blocks.max(1)];
-        for node in &nodes {
-            let end = node.end_block.min(total_blocks.saturating_sub(1));
-            for b in node.start_block..=end {
-                if b < covered.len() {
-                    covered[b] = true;
+    /// Aggregate stats over the current snapshot.
+    ///
+    /// `total_blocks` of `None` means "ask the network": coverage is measured
+    /// against the largest model actually registered in the DHT. The
+    /// `TOTAL_BLOCKS` env var overrides it. Getting this wrong is the classic
+    /// misreport — an 80-block default against a 32-block model understates
+    /// coverage by 2.5×.
+    pub fn stats(&self, total_blocks: Option<usize>) -> NetworkStats {
+        let snapshot = self.snapshot();
+        let nodes = self.nodes();
+
+        let total = total_blocks
+            .or_else(|| {
+                snapshot
+                    .model_reports
+                    .iter()
+                    .map(|m| m.num_blocks.max(0) as usize)
+                    .max()
+                    .filter(|n| *n > 0)
+            })
+            .unwrap_or(80);
+
+        let mut covered = vec![false; total];
+        for report in &snapshot.model_reports {
+            for row in &report.server_rows {
+                if row.state != "online" {
+                    continue;
+                }
+                let start = row.span.start.max(0) as usize;
+                let end = (row.span.end.max(0) as usize).min(total.saturating_sub(1));
+                for slot in covered.iter_mut().take(end + 1).skip(start) {
+                    *slot = true;
                 }
             }
         }
-        let covered_count = covered.iter().filter(|&&c| c).count();
-        let coverage_pct = if total_blocks == 0 {
-            0.0
-        } else {
-            covered_count as f64 / total_blocks as f64 * 100.0
-        };
+        let covered_count = covered.iter().filter(|c| **c).count();
 
         NetworkStats {
-            node_count,
-            tokens_per_sec,
-            coverage_pct,
-            active_sessions,
+            node_count: nodes.len(),
+            tokens_per_sec: nodes.iter().map(|n| n.throughput).sum(),
+            coverage_pct: if total == 0 {
+                0.0
+            } else {
+                covered_count as f64 / total as f64 * 100.0
+            },
+            active_sessions: nodes.iter().filter(|n| n.is_active()).count(),
+            total_blocks: total,
         }
     }
 }
@@ -91,4 +126,6 @@ pub struct NetworkStats {
     pub tokens_per_sec: f64,
     pub coverage_pct: f64,
     pub active_sessions: usize,
+    /// What `coverage_pct` was measured against.
+    pub total_blocks: usize,
 }

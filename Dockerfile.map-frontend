@@ -1,11 +1,10 @@
-FROM node:20-slim AS builder
-WORKDIR /app
-COPY apps/map/package.json apps/map/package-lock.json* ./
-RUN npm install
-COPY apps/map/ ./
-RUN npm run build
-
+# map-frontend — the map/table/topology page, served statically.
+#
+# The page is a single file with no build step: it fetches api/v1/state and
+# renders all three views client-side. It is taken from the v1 service's
+# directory rather than copied, so the two cannot drift while both exist —
+# v1 keeps serving it from Flask, v2 from nginx, off the same source.
 FROM nginx:alpine
-COPY --from=builder /app/dist /usr/share/nginx/html
+COPY docker/kwaainet_health/kwaainet.html /usr/share/nginx/html/index.html
 COPY docker/map-nginx.conf /etc/nginx/conf.d/default.conf
 EXPOSE 80

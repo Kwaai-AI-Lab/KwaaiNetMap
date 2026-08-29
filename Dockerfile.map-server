@@ -1,13 +1,18 @@
 # map-server — the Rust map API.
 #
-# Build context is the repo root:
+# One process. The libp2p swarm runs inside it via `kwaai-p2p` (rust-libp2p),
+# so there is no `kwaainet` node beside it, no p2pd control socket, and no Go
+# toolchain — only `kwaai-p2p-daemon`, which wraps the standalone Go libp2p
+# daemon KwaaiNet has replaced, ever needed one.
+#
 #   docker build -f Dockerfile.map-server -t kwaainetmap-server .
 FROM rust:slim AS builder
 WORKDIR /src
 
-# protoc for kwaai-p2p-daemon's build script; it would otherwise download one.
+# protoc compiles the Hivemind DHT protos; kwaai-hivemind-dht's build script
+# would otherwise download one.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      pkg-config libssl-dev protobuf-compiler git ca-certificates \
+      pkg-config protobuf-compiler ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY map-server/ ./map-server/
@@ -15,11 +20,16 @@ WORKDIR /src/map-server
 RUN cargo build --release
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /src/map-server/target/release/map-server /usr/local/bin/map-server
 
-ENV BIND_ADDR=0.0.0.0:3030
-ENV RUST_LOG=map_server=info,tower_http=info
+# The observer generates an ephemeral keypair per start: nothing dials the map,
+# so there is no identity to persist and no volume to mount.
+ENV BIND_ADDR=0.0.0.0:3030 \
+    RUST_LOG=map_server=info,tower_http=info
+
 EXPOSE 3030
-CMD ["map-server"]
+ENTRYPOINT ["/usr/local/bin/map-server"]

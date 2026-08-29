@@ -1,0 +1,44 @@
+# The deployed map stack: the API (with its observer node) behind nginx.
+#
+# Images are pulled by tag, never built here — the host is a t3.small with no
+# Rust toolchain. KwaaiNetMap's build-images workflow pushes them to GHCR;
+# KwaaiNetOps pins which tag a given host runs, in terraform/variables.tf.
+#
+#   MAP_IMAGE_TAG=v0.7.0 docker compose -f docker-compose.map.yml up -d
+services:
+  map-server:
+    image: ghcr.io/kwaai-ai-lab/map-server:${MAP_IMAGE_TAG:-latest}
+    container_name: map-server
+    restart: unless-stopped
+    environment:
+      # Space-separated, and every entry must carry /p2p/<PeerId>: the crawler
+      # reads the peer id out of the multiaddr and skips entries without one.
+      - BOOTSTRAP_PEERS=${BOOTSTRAP_PEERS:?set BOOTSTRAP_PEERS to the fleet multiaddrs}
+      - BIND_ADDR=0.0.0.0:3030
+      # Unset means "measure coverage against the largest model the DHT
+      # registers", which is right far more often than a fixed number. Set it
+      # only to pin coverage to one model.
+      - TOTAL_BLOCKS=${TOTAL_BLOCKS:-}
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-*}
+      - GEOIP_ENABLED=${GEOIP_ENABLED:-1}
+      - RUST_LOG=${RUST_LOG:-map_server=info,tower_http=info}
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -fsS http://127.0.0.1:3030/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Long enough for the swarm to come up and dial a bootstrap.
+      start_period: 60s
+    expose:
+      - "3030"
+
+  map-frontend:
+    image: ghcr.io/kwaai-ai-lab/map-frontend:${MAP_IMAGE_TAG:-latest}
+    container_name: map-frontend
+    restart: unless-stopped
+    depends_on:
+      - map-server
+    # Published on the host's port 80. TLS terminates upstream (Cloudflare),
+    # as it does for v1.
+    ports:
+      - "80:80"

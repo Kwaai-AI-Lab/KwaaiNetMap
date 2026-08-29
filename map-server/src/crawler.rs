@@ -1,419 +1,617 @@
 //! Background DHT crawler.
 //!
-//! Every 60 seconds this task dials each bootstrap peer via p2pd and sends a
-//! `FindRequest` for all known DHT key prefixes. Results are decoded from the
-//! Hivemind Ext(64) wire format and stored in the [`NodeCache`].
+//! Runs against this process's own rust-libp2p swarm (see [`crate::observer`]):
+//! dial the bootstraps, then `DHTProtocol.rpc_find` over `call_unary_handler`.
+//! No Go daemon and no control socket are involved.
 //!
-//! Wire format (from node.rs / shard_cmd.rs):
-//! ```text
-//! Ext(64, msgpack([state_i32, throughput_f64, {fields_map}]))
-//! fields_map keys: start_block, end_block, public_name, version,
-//!                  torch_dtype, using_relay, cache_tokens_left,
-//!                  adapters, next_pings, peer_id, trust_attestations, vpk
-//! ```
+//! Each pass walks the `_petals.models` registry for the models on the
+//! network, then every block key of each model, and folds the results into one
+//! [`Snapshot`]. The model dimension is kept rather than flattened because
+//! `/api/v1/state` is reported per model.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use chrono::Utc;
 use kwaai_hivemind_dht::protocol::{FindRequest, FindResponse, NodeInfo, RequestAuthInfo};
-use kwaai_p2p::NetworkConfig;
-use kwaai_p2p_daemon::{P2PClient, DEFAULT_SOCKET_NAME};
-use libp2p::PeerId;
+use kwaai_hivemind_dht::PROTOCOL_FIND;
+use kwaai_p2p::{NetworkHandle, PeerId};
 use prost::Message as _;
 use sha1::{Digest, Sha1};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cache::{NodeCache, NodeEntry};
+use crate::dht::{decode_model_registry, decode_server_info, dht_key, dictionary_entries};
+use crate::geoip::{public_ips, GeoIp};
+use crate::snapshot::{
+    short_peer_id, Contributor, ModelReport, PeerIpInfo, PeerSpan, ReachabilityIssue, ServerInfo,
+    ServerRow, Snapshot,
+};
 
-/// Fallback DHT key prefixes in effective_dht_prefix format (org stripped, dots→dashes).
-/// These cover known KwaaiNet model prefixes. The crawler also auto-discovers prefixes
-/// from the `_petals.models` registry at runtime.
+/// The `_petals.models` registry names the models actually on the network.
+/// These are only used when it comes back empty, so a mid-migration DHT still
+/// yields a map instead of a blank page.
 const FALLBACK_PREFIXES: &[&str] = &[
     "Llama-3-1-8B-Instruct",
-    "Llama-2-70b-chat-hf",
     "Meta-Llama-3-1-8B-Instruct",
+    "Llama-2-70b-chat-hf",
     "bloom",
 ];
 
-/// Total blocks to scan per prefix (upper bound; missing keys return empty).
-const SCAN_BLOCKS: usize = 80;
+/// Block count assumed for a fallback prefix, which carries no registration.
+const FALLBACK_BLOCKS: i64 = 80;
 
-/// How often to re-crawl the DHT.
-const CRAWL_INTERVAL_SECS: u64 = 60;
+/// Upper bound on block keys queried for one model — a guard against a
+/// malformed registration asking for a million-key `FindRequest`.
+const MAX_BLOCKS: i64 = 512;
 
-pub async fn run_crawler(cache: Arc<NodeCache>, bootstrap_peers: Vec<String>) {
+const CRAWL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Bound on one bootstrap probe. `connect_peer` asks the daemon for a 60 s
+/// dial timeout, so without this a fleet with two dead bootstraps would spend
+/// two minutes of every crawl interval waiting to find that out.
+const BOOTSTRAP_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Records for nodes that announce a capability rather than a block range.
+const CAPABILITY_KEYS: &[&str] = &["_kwaai.vpk.nodes", "_kwaai.inference.nodes"];
+
+/// What one peer publishes for one model, folded across that model's blocks.
+struct PeerModelEntry {
+    blocks: BTreeSet<i64>,
+    info: ServerInfo,
+}
+
+pub async fn run_crawler(
+    cache: Arc<NodeCache>,
+    handle: NetworkHandle,
+    bootstrap_peers: Vec<String>,
+) {
+    let geo = GeoIp::from_env();
     loop {
-        if let Err(e) = crawl_once(&cache, &bootstrap_peers).await {
-            warn!("DHT crawl error: {e:#}");
+        match crawl_once(&handle, &bootstrap_peers, &geo).await {
+            Ok(Some(snapshot)) => {
+                info!(
+                    "crawl complete: {} peer(s), {} model(s), {}/{} bootstrap online",
+                    snapshot.num_peers,
+                    snapshot.model_reports.len(),
+                    snapshot
+                        .bootstrap_states
+                        .iter()
+                        .filter(|s| *s == "online")
+                        .count(),
+                    snapshot.bootstrap_states.len(),
+                );
+                cache.replace(snapshot);
+            }
+            // Reserved for a transport failure with nothing to publish.
+            Ok(None) => {}
+            Err(e) => warn!("DHT crawl error: {e:#}"),
         }
-        tokio::time::sleep(Duration::from_secs(CRAWL_INTERVAL_SECS)).await;
+        tokio::time::sleep(CRAWL_INTERVAL).await;
     }
 }
 
-async fn crawl_once(cache: &NodeCache, bootstrap_peers: &[String]) -> Result<()> {
-    let raw_sock =
-        std::env::var("KWAAINET_SOCKET").unwrap_or_else(|_| DEFAULT_SOCKET_NAME.to_string());
-    let socket = if cfg!(unix) {
-        format!("/unix/{}", raw_sock)
-    } else {
-        "/ip4/127.0.0.1/tcp/5005".to_string()
-    };
-    let mut client = match P2PClient::connect(&socket).await {
-        Ok(c) => c,
-        Err(e) => {
-            warn!("Cannot connect to p2pd at {socket}: {e}");
-            return Ok(());
-        }
-    };
-
-    let peer_id_hex = client.identify().await?;
-    tracing::debug!("identify ok, peer_id_hex len={}", peer_id_hex.len());
-    let our_peer_id =
-        PeerId::from_bytes(&hex::decode(&peer_id_hex)?).unwrap_or_else(|_| PeerId::random());
+/// One full pass. `Ok(None)` is unreachable now that the swarm is in-process;
+/// the signature keeps it so a future transport failure has somewhere to go.
+async fn crawl_once(
+    handle: &NetworkHandle,
+    bootstrap_peers: &[String],
+    geo: &GeoIp,
+) -> Result<Option<Snapshot>> {
     let our_dhtid = Sha1::new()
-        .chain_update(our_peer_id.to_bytes())
+        .chain_update(handle.peer_id().to_bytes())
         .finalize()
         .to_vec();
 
-    let effective_bootstrap: Vec<String> = if bootstrap_peers.is_empty() {
-        NetworkConfig::with_petals_bootstrap().bootstrap_peers
-    } else {
-        bootstrap_peers.to_vec()
-    };
+    let bootstraps = bootstrap_peers.to_vec();
 
-    let mut discovered: HashMap<String, NodeEntry> = HashMap::new();
-
-    // Step 1: discover registered model prefixes from _petals.models registry
-    let mut active_prefixes: Vec<String> =
-        FALLBACK_PREFIXES.iter().map(|s| s.to_string()).collect();
-    if let Ok(extra) = fetch_model_prefixes(&mut client, &our_dhtid, &effective_bootstrap).await {
-        for p in extra {
-            if !active_prefixes.contains(&p) {
-                active_prefixes.push(p);
-            }
-        }
+    // Dial every bootstrap once up front. The dials are what the queries below
+    // ride; they are NOT the reported state — see BootstrapSet.
+    let mut set = BootstrapSet::new(&bootstraps);
+    for entry in &mut set.entries {
+        entry.dialed = entry.addr.contains("/p2p/")
+            && matches!(
+                tokio::time::timeout(BOOTSTRAP_DIAL_TIMEOUT, handle.connect_peer(&entry.addr))
+                    .await,
+                Ok(Ok(_))
+            );
     }
-    tracing::debug!(
-        "crawling {} prefix(es): {:?}",
-        active_prefixes.len(),
-        active_prefixes
-    );
+    if !set.has_dialable() {
+        warn!("no bootstrap dialable — publishing an empty snapshot");
+        return Ok(Some(Snapshot {
+            bootstrap_states: set.states(),
+            ..Default::default()
+        }));
+    }
+    // Give the dials a moment to settle before the first RPC rides them.
+    tokio::time::sleep(Duration::from_millis(400)).await;
 
-    // Step 2: also crawl VPK nodes registry
-    active_prefixes.push("_kwaai.vpk.nodes".to_string());
+    let models = discover_models(handle, &our_dhtid, &mut set).await;
+    debug!("crawling {} model(s)", models.len());
 
-    for prefix in &active_prefixes {
-        let keys: Vec<Vec<u8>> = if prefix.starts_with("_kwaai") {
-            vec![dht_key(prefix)]
-        } else {
-            (0..SCAN_BLOCKS)
-                .map(|b| dht_key(&format!("{}.{}", prefix, b)))
-                .collect()
-        };
+    // prefix -> peer -> blocks + info
+    let mut per_model: BTreeMap<String, HashMap<String, PeerModelEntry>> = BTreeMap::new();
+    for model in &models {
+        let entry = per_model.entry(model.dht_prefix.clone()).or_default();
+        collect_model(handle, &our_dhtid, &mut set, model, entry).await;
+    }
 
-        let find_req = FindRequest {
-            auth: Some(RequestAuthInfo::new()),
-            keys,
-            peer: Some(NodeInfo {
-                node_id: our_dhtid.clone(),
-            }),
-        };
-        let mut req_bytes = Vec::new();
-        find_req.encode(&mut req_bytes)?;
+    // Nodes that announce a capability but serve no blocks would otherwise be
+    // invisible; they belong in /api/nodes even with no model to sit under.
+    let mut capability_peers: HashMap<String, ServerInfo> = HashMap::new();
+    for key in CAPABILITY_KEYS {
+        collect_capability(handle, &our_dhtid, &mut set, key, &mut capability_peers).await;
+    }
 
-        for addr in &effective_bootstrap {
-            let Some(peer_str) = addr.split("/p2p/").nth(1) else {
-                continue;
-            };
-            let bp = match peer_str.parse::<PeerId>() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
+    let addrs = observed_addrs(handle).await;
+    geo.warm(
+        &addrs
+            .values()
+            .flat_map(|a| public_ips(a))
+            .collect::<Vec<_>>(),
+    )
+    .await;
 
-            if client.connect_peer(addr).await.is_err() {
-                continue;
-            }
-            tokio::time::sleep(Duration::from_millis(400)).await;
+    Ok(Some(build_snapshot(
+        set.states(),
+        &models,
+        per_model,
+        capability_peers,
+        &addrs,
+        geo,
+    )))
+}
 
-            let resp_bytes = match client
-                .call_unary_handler(&bp.to_bytes(), "DHTProtocol.rpc_find", &req_bytes)
-                .await
-            {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!("rpc_find failed for {addr}: {e}");
-                    continue;
-                }
-            };
+// ── Bootstrap health ──────────────────────────────────────────────────────────
 
-            tracing::debug!("rpc_find response {} bytes from {addr}", resp_bytes.len());
+/// The bootstraps, and what this crawl has learned about each.
+///
+/// `bootstrap_states` is the field the debugging docs tell an operator to check
+/// when their node cannot connect, so it has to mean something. A successful
+/// `connect_peer` does not: the daemon accepts the request and returns Ok
+/// before it knows whether a route exists, so an address that is simply dead
+/// dials "successfully" and then fails every query with "peer not found in
+/// DHT". Only an answered query is evidence, so that is what marks a bootstrap
+/// online.
+struct BootstrapEntry {
+    addr: String,
+    /// The initial dial did not error. Necessary to try a query, not evidence.
+    dialed: bool,
+    /// It answered a query this pass. This is what "online" means.
+    answered: bool,
+}
 
-            let Ok(resp) = FindResponse::decode(&resp_bytes[..]) else {
-                warn!("FindResponse decode failed for {addr}");
-                continue;
-            };
+struct BootstrapSet {
+    entries: Vec<BootstrapEntry>,
+}
 
-            tracing::debug!("{} results in FindResponse from {addr}", resp.results.len());
-
-            for result in &resp.results {
-                if result.value.is_empty() {
-                    continue;
-                }
-                tracing::debug!(
-                    "  result rt={} value_len={}",
-                    result.result_type,
-                    result.value.len()
-                );
-                match result.result_type {
-                    1 => {
-                        if let Some(entry) = decode_regular(&result.value) {
-                            tracing::debug!("  → decoded peer {}", entry.peer_id);
-                            discovered.entry(entry.peer_id.clone()).or_insert(entry);
-                        } else {
-                            tracing::debug!("  → decode_regular returned None");
-                        }
-                    }
-                    2 => decode_dictionary(&result.value, &mut discovered),
-                    _ => {}
-                }
-            }
+impl BootstrapSet {
+    fn new(addrs: &[String]) -> Self {
+        Self {
+            entries: addrs
+                .iter()
+                .map(|addr| BootstrapEntry {
+                    addr: addr.clone(),
+                    dialed: false,
+                    answered: false,
+                })
+                .collect(),
         }
     }
 
-    let count = discovered.len();
-    for entry in discovered.into_values() {
-        cache.upsert(entry);
+    fn has_dialable(&self) -> bool {
+        self.entries.iter().any(|e| e.dialed)
     }
-    info!("DHT crawl complete: {count} peer(s) found");
-    Ok(())
+
+    /// Addresses still worth asking. A bootstrap that has already failed a
+    /// query this pass is dropped: every later query would cost the same dial
+    /// timeout to learn the same thing, which is minutes across a crawl.
+    fn live(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|e| e.dialed)
+            .map(|e| e.addr.clone())
+            .collect()
+    }
+
+    fn record(&mut self, addr: &str, answered: bool) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.addr == addr) {
+            if answered {
+                entry.answered = true;
+            } else {
+                entry.dialed = false;
+            }
+        }
+    }
+
+    fn states(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .map(|e| if e.answered { "online" } else { "offline" }.to_string())
+            .collect()
+    }
 }
 
-// ── DHT key helpers ────────────────────────────────────────────────────────────
+// ── DHT queries ───────────────────────────────────────────────────────────────
 
-/// SHA1(msgpack(raw_key)) — matches node.rs `dht_id()` / Hivemind DHTID.generate().
-fn dht_key(raw_key: &str) -> Vec<u8> {
-    let packed = rmp_serde::to_vec(raw_key).expect("msgpack key");
-    Sha1::new().chain_update(&packed).finalize().to_vec()
-}
-
-/// Fetch registered model prefixes from the `_petals.models` DHT registry.
-/// Returns effective_dht_prefix strings (e.g. "Llama-3-1-8B-Instruct").
-async fn fetch_model_prefixes(
-    client: &mut P2PClient,
+/// Ask one bootstrap for a batch of keys, recording whether it answered.
+/// Results are positionally aligned with the keys sent, which is how a response
+/// is mapped back to a block index.
+async fn rpc_find(
+    handle: &NetworkHandle,
     our_dhtid: &[u8],
-    bootstrap_peers: &[String],
-) -> anyhow::Result<Vec<String>> {
-    let find_req = FindRequest {
+    set: &mut BootstrapSet,
+    bootstrap: &str,
+    keys: Vec<Vec<u8>>,
+) -> Option<FindResponse> {
+    let response = rpc_find_inner(handle, our_dhtid, bootstrap, keys).await;
+    set.record(bootstrap, response.is_some());
+    response
+}
+
+async fn rpc_find_inner(
+    handle: &NetworkHandle,
+    our_dhtid: &[u8],
+    bootstrap: &str,
+    keys: Vec<Vec<u8>>,
+) -> Option<FindResponse> {
+    let bp: PeerId = bootstrap.split("/p2p/").nth(1)?.parse().ok()?;
+    let request = FindRequest {
         auth: Some(RequestAuthInfo::new()),
-        keys: vec![dht_key("_petals.models")],
+        keys,
         peer: Some(NodeInfo {
             node_id: our_dhtid.to_vec(),
         }),
     };
-    let mut req_bytes = Vec::new();
-    find_req.encode(&mut req_bytes)?;
+    let mut bytes = Vec::new();
+    request.encode(&mut bytes).ok()?;
 
-    let mut prefixes = Vec::new();
-    for addr in bootstrap_peers {
-        let Some(peer_str) = addr.split("/p2p/").nth(1) else {
-            continue;
-        };
-        let Ok(bp) = peer_str.parse::<PeerId>() else {
-            continue;
-        };
-        if client.connect_peer(addr).await.is_err() {
-            continue;
+    match handle.call_unary_handler(bp, PROTOCOL_FIND, &bytes).await {
+        Ok(resp) => FindResponse::decode(&resp[..]).ok(),
+        Err(e) => {
+            warn!("rpc_find failed against {bootstrap}: {e}");
+            None
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let Ok(resp_bytes) = client
-            .call_unary_handler(&bp.to_bytes(), "DHTProtocol.rpc_find", &req_bytes)
-            .await
+    }
+}
+
+struct Model {
+    dht_prefix: String,
+    repository: String,
+    num_blocks: i64,
+}
+
+/// Read `_petals.models` for the models on the network, falling back to the
+/// known prefixes when the registry is empty or unreachable.
+async fn discover_models(
+    handle: &NetworkHandle,
+    our_dhtid: &[u8],
+    set: &mut BootstrapSet,
+) -> Vec<Model> {
+    let mut found: BTreeMap<String, Model> = BTreeMap::new();
+
+    for addr in set.live() {
+        let Some(resp) = rpc_find(
+            handle,
+            our_dhtid,
+            set,
+            &addr,
+            vec![dht_key("_petals.models")],
+        )
+        .await
         else {
             continue;
         };
-        let Ok(resp) = FindResponse::decode(&resp_bytes[..]) else {
-            continue;
-        };
-
-        for result in resp.results {
+        for result in &resp.results {
             if result.value.is_empty() {
                 continue;
             }
-            if result.result_type == 2 {
-                // FoundDictionary: subkeys are msgpack(prefix_string)
-                if let Some(subs) = extract_dict_subkeys(&result.value) {
-                    prefixes.extend(subs);
-                }
+            for reg in decode_model_registry(&result.value) {
+                let num_blocks = reg.num_blocks.clamp(1, MAX_BLOCKS);
+                found.entry(reg.dht_prefix.clone()).or_insert(Model {
+                    dht_prefix: reg.dht_prefix,
+                    repository: reg.repository,
+                    num_blocks,
+                });
             }
         }
-        if !prefixes.is_empty() {
+        if !found.is_empty() {
             break;
         }
     }
-    Ok(prefixes)
+
+    if found.is_empty() {
+        warn!("_petals.models registry empty — falling back to known prefixes");
+        return FALLBACK_PREFIXES
+            .iter()
+            .map(|p| Model {
+                dht_prefix: p.to_string(),
+                repository: String::new(),
+                num_blocks: FALLBACK_BLOCKS,
+            })
+            .collect();
+    }
+    found.into_values().collect()
 }
 
-fn extract_dict_subkeys(bytes: &[u8]) -> Option<Vec<String>> {
-    let outer = rmpv::decode::read_value(&mut &bytes[..]).ok()?;
-    let inner_bytes = match &outer {
-        rmpv::Value::Ext(80, b) => b.as_slice(),
-        _ => return None,
-    };
-    let inner = rmpv::decode::read_value(&mut &inner_bytes[..]).ok()?;
-    let arr = inner.as_array()?;
-    if arr.len() < 3 {
-        return None;
+/// Query every block key of one model and fold the servers found under each.
+async fn collect_model(
+    handle: &NetworkHandle,
+    our_dhtid: &[u8],
+    set: &mut BootstrapSet,
+    model: &Model,
+    out: &mut HashMap<String, PeerModelEntry>,
+) {
+    let keys: Vec<Vec<u8>> = (0..model.num_blocks)
+        .map(|b| dht_key(&format!("{}.{}", model.dht_prefix, b)))
+        .collect();
+
+    for addr in set.live() {
+        let Some(resp) = rpc_find(handle, our_dhtid, set, &addr, keys.clone()).await else {
+            continue;
+        };
+        for (index, result) in resp.results.iter().enumerate() {
+            if result.value.is_empty() {
+                continue;
+            }
+            let block = index as i64;
+            for (peer_id, info) in servers_in(result.result_type, &result.value) {
+                let entry = out.entry(peer_id).or_insert_with(|| PeerModelEntry {
+                    blocks: BTreeSet::new(),
+                    info: info.clone(),
+                });
+                entry.blocks.insert(block);
+                // Later bootstraps can hold a fresher copy of the same record.
+                if info.state == "online" {
+                    entry.info = info;
+                }
+            }
+        }
     }
-    let entries = arr[2].as_array()?;
-    let mut result = Vec::new();
-    for entry in entries {
-        let arr = entry.as_array()?;
-        if arr.is_empty() {
+}
+
+/// Query one capability registry (`_kwaai.vpk.nodes`, `_kwaai.inference.nodes`).
+///
+/// These two do not agree on a value shape: the inference registry holds an
+/// `Ext(64)` server record, the VPK one a plain msgpack capability map. The
+/// subkey is a peer id in both, so the peer is counted either way and the
+/// record is decoded only if it happens to be one.
+async fn collect_capability(
+    handle: &NetworkHandle,
+    our_dhtid: &[u8],
+    set: &mut BootstrapSet,
+    key: &str,
+    out: &mut HashMap<String, ServerInfo>,
+) {
+    for addr in set.live() {
+        let Some(resp) = rpc_find(handle, our_dhtid, set, &addr, vec![dht_key(key)]).await else {
+            continue;
+        };
+        for result in &resp.results {
+            if result.value.is_empty() {
+                continue;
+            }
+            for (peer_id, raw) in dictionary_entries(&result.value) {
+                let info = decode_server_info(&raw).unwrap_or(ServerInfo {
+                    state: "unknown".to_string(),
+                    ..Default::default()
+                });
+                out.entry(peer_id).or_insert(info);
+            }
+        }
+    }
+}
+
+/// Servers carried by one `FindResult`, whichever result type it came back as.
+///
+/// A dictionary is the normal case — many servers subkeyed by peer id under one
+/// block key. A regular value only ever holds one, and identifies its peer from
+/// inside the record.
+fn servers_in(result_type: i32, value: &[u8]) -> Vec<(String, ServerInfo)> {
+    const REGULAR: i32 = 1;
+    const DICTIONARY: i32 = 2;
+
+    match result_type {
+        DICTIONARY => dictionary_entries(value)
+            .into_iter()
+            .filter_map(|(peer_id, raw)| Some((peer_id, decode_server_info(&raw)?)))
+            .collect(),
+        REGULAR => decode_server_info(value)
+            .and_then(|info| Some(vec![(info.peer_id.clone()?, info)]))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Addresses of every peer the observer currently holds a connection to.
+///
+/// This is the only source of peer addresses: DHT records carry peer ids, never
+/// addresses. A peer we are not connected to therefore has no location, which
+/// matches what v1 could see.
+///
+/// `list_peers` reports one entry per *connection*, so a peer reached more than
+/// one way appears more than once; the addresses are grouped back per peer.
+async fn observed_addrs(handle: &NetworkHandle) -> HashMap<String, Vec<String>> {
+    let peers = match handle.list_peers().await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("list_peers failed: {e}");
+            return HashMap::new();
+        }
+    };
+
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for peer in peers {
+        out.entry(peer.peer_id.to_base58())
+            .or_default()
+            .push(peer.addr.to_string());
+    }
+    out
+}
+
+// ── Snapshot assembly ─────────────────────────────────────────────────────────
+
+fn build_snapshot(
+    bootstrap_states: Vec<String>,
+    models: &[Model],
+    per_model: BTreeMap<String, HashMap<String, PeerModelEntry>>,
+    capability_peers: HashMap<String, ServerInfo>,
+    addrs: &HashMap<String, Vec<String>>,
+    geo: &GeoIp,
+) -> Snapshot {
+    let mut model_reports = Vec::new();
+    let mut all_peers: BTreeSet<String> = BTreeSet::new();
+    let mut blocks_covered = 0usize;
+    let mut issues = Vec::new();
+
+    for model in models {
+        let Some(peers) = per_model.get(&model.dht_prefix) else {
+            continue;
+        };
+        if peers.is_empty() {
             continue;
         }
-        let prefix = match &arr[0] {
-            rmpv::Value::String(s) => s.as_str().unwrap_or("").to_string(),
-            rmpv::Value::Binary(b) => match rmpv::decode::read_value(&mut b.as_slice()) {
-                Ok(rmpv::Value::String(s)) => s.as_str().unwrap_or("").to_string(),
-                _ => continue,
-            },
-            _ => continue,
-        };
-        if !prefix.is_empty() {
-            result.push(prefix)
-        }
-    }
-    Some(result)
-}
 
-// ── Decoder: FoundRegular (rt=1) ──────────────────────────────────────────────
+        let mut covered: BTreeSet<i64> = BTreeSet::new();
+        let mut server_rows = Vec::new();
+        for (peer_id, entry) in peers {
+            all_peers.insert(peer_id.clone());
+            if entry.info.state == "online" {
+                covered.extend(entry.blocks.iter().copied());
+            } else {
+                issues.push(ReachabilityIssue {
+                    peer_id: peer_id.clone(),
+                    err: format!("server state is {}", entry.info.state),
+                });
+            }
 
-fn decode_regular(bytes: &[u8]) -> Option<NodeEntry> {
-    let val = rmpv::decode::read_value(&mut &bytes[..]).ok()?;
-    let inner_bytes = match &val {
-        rmpv::Value::Ext(64, b) => b.as_slice(),
-        _ => return None,
-    };
-    let inner = rmpv::decode::read_value(&mut &inner_bytes[..]).ok()?;
-    let arr = inner.as_array()?;
-    if arr.len() < 3 {
-        return None;
-    }
-
-    let throughput = arr[1].as_f64().unwrap_or(0.0);
-    let map = arr[2].as_map()?;
-
-    let get_i = |k: &str| -> Option<i64> {
-        map.iter()
-            .find(|(ky, _)| ky.as_str() == Some(k))
-            .and_then(|(_, v)| v.as_i64())
-    };
-    let get_s = |k: &str| -> String {
-        map.iter()
-            .find(|(ky, _)| ky.as_str() == Some(k))
-            .and_then(|(_, v)| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    };
-    let _get_bool = |k: &str| -> bool {
-        map.iter()
-            .find(|(ky, _)| ky.as_str() == Some(k))
-            .and_then(|(_, v)| v.as_bool())
-            .unwrap_or(false)
-    };
-
-    let start_block = get_i("start_block")? as usize;
-    let end_block = get_i("end_block")? as usize;
-    let public_name = get_s("public_name");
-    let peer_id_b58 = get_s("peer_id");
-    let version = get_s("version");
-    let vpk = map.iter().any(|(k, _)| k.as_str() == Some("vpk"));
-
-    // Derive trust tier from trust_attestations count (VC-backed scoring TBD)
-    let ta_count = map
-        .iter()
-        .find(|(k, _)| k.as_str() == Some("trust_attestations"))
-        .and_then(|(_, v)| v.as_array())
-        .map(|a| a.len())
-        .unwrap_or(0);
-    let trust_tier = tier_from_vc_count(ta_count).to_string();
-
-    Some(NodeEntry {
-        peer_id: if peer_id_b58.is_empty() {
-            format!("unknown:{}", bs58::encode(rand_bytes(8)).into_string())
-        } else {
-            peer_id_b58
-        },
-        trust_tier,
-        start_block,
-        end_block,
-        throughput,
-        public_name,
-        version,
-        vpk,
-        last_seen: Utc::now(),
-    })
-}
-
-// ── Decoder: FoundDictionary (rt=2, Python Hivemind) ─────────────────────────
-
-fn decode_dictionary(bytes: &[u8], out: &mut HashMap<String, NodeEntry>) {
-    let outer = match rmpv::decode::read_value(&mut &bytes[..]) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let inner_bytes = match &outer {
-        rmpv::Value::Ext(80, b) => b.as_slice(),
-        _ => return,
-    };
-    let inner = match rmpv::decode::read_value(&mut &inner_bytes[..]) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let outer_arr = match inner.as_array() {
-        Some(a) if a.len() >= 3 => a,
-        _ => return,
-    };
-    let entries = match outer_arr[2].as_array() {
-        Some(e) => e,
-        None => return,
-    };
-
-    for entry in entries {
-        let arr = match entry.as_array() {
-            Some(a) if a.len() >= 2 => a,
-            _ => continue,
-        };
-
-        // Subkey is rmp_serde::to_vec(&peer_id_base58) = msgpack(string)
-        let peer_id_b58 = match &arr[0] {
-            rmpv::Value::String(s) => s.as_str().unwrap_or("").to_string(),
-            rmpv::Value::Binary(b) => match rmpv::decode::read_value(&mut b.as_slice()) {
-                Ok(rmpv::Value::String(s)) => s.as_str().unwrap_or("").to_string(),
-                _ => continue,
-            },
-            _ => continue,
-        };
-        if peer_id_b58.is_empty() {
-            continue;
-        }
-
-        // Value bytes: rmp_serde encoded NodeEntry map
-        let val_bytes = match &arr[1] {
-            rmpv::Value::Binary(b) => b.as_slice(),
-            _ => continue,
-        };
-        if let Some(entry) = decode_regular(val_bytes) {
-            out.entry(peer_id_b58.clone()).or_insert(NodeEntry {
-                peer_id: peer_id_b58,
-                ..entry
+            let peer_addrs = addrs.get(peer_id).cloned().unwrap_or_default();
+            server_rows.push(ServerRow {
+                short_peer_id: short_peer_id(peer_id),
+                peer_id: peer_id.clone(),
+                show_public_name: entry.info.public_name.is_some(),
+                state: entry.info.state.clone(),
+                peer_ip_info: PeerIpInfo {
+                    location: geo.locate(&peer_addrs),
+                    multiaddrs: peer_addrs,
+                },
+                span: PeerSpan {
+                    peer_id: peer_id.clone(),
+                    start: entry.blocks.iter().next().copied().unwrap_or(0),
+                    end: entry.blocks.iter().next_back().copied().unwrap_or(0),
+                    server_info: entry.info.clone(),
+                },
             });
         }
+        server_rows.sort_by(|a, b| {
+            a.span
+                .start
+                .cmp(&b.span.start)
+                .then(a.peer_id.cmp(&b.peer_id))
+        });
+        blocks_covered += covered.len();
+
+        let name = model_name(&model.repository, &model.dht_prefix);
+        model_reports.push(ModelReport {
+            short_name: name.rsplit('/').next().unwrap_or(&name).to_string(),
+            name,
+            dht_prefix: model.dht_prefix.clone(),
+            repository: model.repository.clone(),
+            num_blocks: model.num_blocks,
+            state: if covered.len() as i64 == model.num_blocks {
+                "healthy".into()
+            } else {
+                "broken".into()
+            },
+            server_rows,
+        });
+    }
+
+    // Most servers first — the page has no sort of its own on this list.
+    model_reports.sort_by_key(|m| std::cmp::Reverse(m.server_rows.len()));
+    all_peers.extend(capability_peers.keys().cloned());
+
+    Snapshot {
+        top_contributors: top_contributors(&model_reports),
+        bootstrap_states,
+        num_peers: all_peers.len(),
+        num_blocks_covered: blocks_covered,
+        model_reports,
+        reachability_issues: issues,
+        last_updated: Utc::now(),
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+/// `unsloth/Llama-3.1-8B-Instruct` from a HuggingFace repository URL, or the
+/// DHT prefix when the model published no repository.
+fn model_name(repository: &str, dht_prefix: &str) -> String {
+    let path = repository
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(repository);
+    match path.split_once('/') {
+        Some((_host, rest)) if !rest.is_empty() => rest.trim_end_matches('/').to_string(),
+        _ => dht_prefix.to_string(),
+    }
+}
+
+/// The five highest-throughput servers on the network.
+fn top_contributors(reports: &[ModelReport]) -> Vec<Contributor> {
+    let mut best: HashMap<String, Contributor> = HashMap::new();
+    for report in reports {
+        for row in &report.server_rows {
+            let candidate = Contributor {
+                peer_id: row.peer_id.clone(),
+                public_name: row.span.server_info.public_name.clone(),
+                throughput: row.span.server_info.throughput,
+                blocks: row.span.end - row.span.start + 1,
+            };
+            best.entry(row.peer_id.clone())
+                .and_modify(|c| {
+                    if candidate.throughput > c.throughput {
+                        *c = candidate.clone();
+                    }
+                })
+                .or_insert(candidate);
+        }
+    }
+    let mut out: Vec<_> = best.into_values().collect();
+    out.sort_by(|a, b| b.throughput.total_cmp(&a.throughput));
+    out.truncate(5);
+    out
+}
+
+/// The flat per-peer view `/api/nodes` and `/api/stats` are built from.
+pub fn node_entries(snapshot: &Snapshot) -> Vec<NodeEntry> {
+    let mut best: HashMap<String, NodeEntry> = HashMap::new();
+    for report in &snapshot.model_reports {
+        for row in &report.server_rows {
+            let info = &row.span.server_info;
+            let entry = NodeEntry {
+                peer_id: row.peer_id.clone(),
+                trust_tier: tier_from_vc_count(info.trust_attestations).to_string(),
+                start_block: row.span.start.max(0) as usize,
+                end_block: row.span.end.max(0) as usize,
+                throughput: info.throughput,
+                public_name: info.public_name.clone().unwrap_or_default(),
+                version: info.version.clone().unwrap_or_default(),
+                vpk: info.vpk.is_some(),
+                last_seen: snapshot.last_updated,
+            };
+            // A peer serving several models appears once, under its best one.
+            best.entry(row.peer_id.clone())
+                .and_modify(|e| {
+                    if entry.throughput > e.throughput {
+                        *e = entry.clone();
+                    }
+                })
+                .or_insert(entry);
+        }
+    }
+    best.into_values().collect()
+}
 
 fn tier_from_vc_count(count: usize) -> &'static str {
     match count {
@@ -424,12 +622,116 @@ fn tier_from_vc_count(count: usize) -> &'static str {
     }
 }
 
-fn rand_bytes(n: usize) -> Vec<u8> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    use std::time::SystemTime;
-    let mut h = DefaultHasher::new();
-    SystemTime::now().hash(&mut h);
-    let v = h.finish().to_le_bytes();
-    v[..n.min(8)].to_vec()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_dialable_bootstrap_is_not_online_until_it_answers() {
+        let mut set = BootstrapSet::new(&["/ip4/1.2.3.4/tcp/8000/p2p/QmA".to_string()]);
+        set.entries[0].dialed = true;
+        // A dial that did not error proves nothing on its own.
+        assert_eq!(set.states(), vec!["offline"]);
+
+        set.record("/ip4/1.2.3.4/tcp/8000/p2p/QmA", true);
+        assert_eq!(set.states(), vec!["online"]);
+    }
+
+    #[test]
+    fn a_failed_query_drops_the_bootstrap_for_the_rest_of_the_pass() {
+        let mut set = BootstrapSet::new(&[
+            "/ip4/1.2.3.4/tcp/8000/p2p/QmA".to_string(),
+            "/ip4/5.6.7.8/tcp/8000/p2p/QmB".to_string(),
+        ]);
+        set.entries.iter_mut().for_each(|e| e.dialed = true);
+
+        set.record("/ip4/1.2.3.4/tcp/8000/p2p/QmA", false);
+        assert_eq!(
+            set.live(),
+            vec!["/ip4/5.6.7.8/tcp/8000/p2p/QmB".to_string()]
+        );
+        assert_eq!(set.states(), vec!["offline", "offline"]);
+    }
+
+    #[test]
+    fn model_name_comes_from_the_repository_url() {
+        assert_eq!(
+            model_name("https://huggingface.co/unsloth/Llama-3.1-8B-Instruct", "x"),
+            "unsloth/Llama-3.1-8B-Instruct"
+        );
+    }
+
+    #[test]
+    fn model_name_falls_back_to_the_prefix() {
+        assert_eq!(
+            model_name("", "Llama-3-1-8B-Instruct"),
+            "Llama-3-1-8B-Instruct"
+        );
+    }
+
+    #[test]
+    fn a_model_is_broken_until_every_block_is_served() {
+        let model = Model {
+            dht_prefix: "M".into(),
+            repository: String::new(),
+            num_blocks: 4,
+        };
+        let mut peers = HashMap::new();
+        peers.insert(
+            "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG".to_string(),
+            PeerModelEntry {
+                blocks: [0, 1, 2].into_iter().collect(),
+                info: ServerInfo {
+                    state: "online".into(),
+                    ..Default::default()
+                },
+            },
+        );
+        let snapshot = build_snapshot(
+            vec!["online".into()],
+            &[model],
+            BTreeMap::from([("M".to_string(), peers)]),
+            HashMap::new(),
+            &HashMap::new(),
+            &GeoIp::from_env(),
+        );
+
+        let report = &snapshot.model_reports[0];
+        assert_eq!(report.state, "broken");
+        assert_eq!(snapshot.num_blocks_covered, 3);
+        assert_eq!(report.server_rows[0].span.end, 2);
+        assert_eq!(report.server_rows[0].short_peer_id, "...WnPbdG");
+    }
+
+    #[test]
+    fn an_offline_server_covers_nothing_and_is_reported() {
+        let model = Model {
+            dht_prefix: "M".into(),
+            repository: String::new(),
+            num_blocks: 2,
+        };
+        let mut peers = HashMap::new();
+        peers.insert(
+            "QmGone".to_string(),
+            PeerModelEntry {
+                blocks: [0, 1].into_iter().collect(),
+                info: ServerInfo {
+                    state: "offline".into(),
+                    ..Default::default()
+                },
+            },
+        );
+        let snapshot = build_snapshot(
+            vec!["online".into()],
+            &[model],
+            BTreeMap::from([("M".to_string(), peers)]),
+            HashMap::new(),
+            &HashMap::new(),
+            &GeoIp::from_env(),
+        );
+
+        assert_eq!(snapshot.num_blocks_covered, 0);
+        assert_eq!(snapshot.model_reports[0].state, "broken");
+        assert_eq!(snapshot.reachability_issues.len(), 1);
+    }
 }
