@@ -17,6 +17,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY map-server/ ./map-server/
 WORKDIR /src/map-server
+
+# Must run before cargo touches the manifest: `[patch.crates-io]` points at a
+# path that this script produces, so cargo cannot even parse Cargo.toml until
+# it has. See patches/README.md for why the patch is needed at all.
+RUN bash patches/fetch-multistream-select.sh
+
 RUN cargo build --release
 
 FROM debian:bookworm-slim

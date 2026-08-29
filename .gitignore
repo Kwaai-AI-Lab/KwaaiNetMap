@@ -5,3 +5,7 @@ __pycache__/
 map-server/target/
 apps/map/node_modules/
 apps/map/dist/
+
+# Expanded by map-server/patches/fetch-multistream-select.sh; only the patch
+# file and the fetch script are committed.
+map-server/patches/multistream-select/
