@@ -175,6 +175,10 @@ pub struct Snapshot {
     pub top_contributors: Vec<Contributor>,
     pub reachability_issues: Vec<ReachabilityIssue>,
     pub last_updated: DateTime<Utc>,
+    /// Seconds between crawls, and how long the last one took. v1 publishes
+    /// both; a dashboard reading them should not lose them at the cutover.
+    pub update_period: u64,
+    pub update_duration: f64,
 }
 
 impl Default for Snapshot {
@@ -187,6 +191,8 @@ impl Default for Snapshot {
             top_contributors: Vec::new(),
             reachability_issues: Vec::new(),
             last_updated: Utc::now(),
+            update_period: 0,
+            update_duration: 0.0,
         }
     }
 }

@@ -97,9 +97,10 @@ impl NodeCache {
                 if row.state != "online" {
                     continue;
                 }
+                // Half-open: a node serving only block 0 announces 0..1.
                 let start = row.span.start.max(0) as usize;
-                let end = (row.span.end.max(0) as usize).min(total.saturating_sub(1));
-                for slot in covered.iter_mut().take(end + 1).skip(start) {
+                let end = (row.span.end.max(0) as usize).min(total);
+                for slot in covered.iter_mut().take(end).skip(start) {
                     *slot = true;
                 }
             }

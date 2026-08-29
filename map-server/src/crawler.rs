@@ -100,6 +100,7 @@ async fn crawl_once(
     bootstrap_peers: &[String],
     geo: &GeoIp,
 ) -> Result<Option<Snapshot>> {
+    let started = std::time::Instant::now();
     let our_dhtid = Sha1::new()
         .chain_update(handle.peer_id().to_bytes())
         .finalize()
@@ -122,6 +123,8 @@ async fn crawl_once(
         warn!("no bootstrap dialable — publishing an empty snapshot");
         return Ok(Some(Snapshot {
             bootstrap_states: set.states(),
+            update_period: CRAWL_INTERVAL.as_secs(),
+            update_duration: started.elapsed().as_secs_f64(),
             ..Default::default()
         }));
     }
@@ -154,14 +157,17 @@ async fn crawl_once(
     )
     .await;
 
-    Ok(Some(build_snapshot(
+    let mut snapshot = build_snapshot(
         set.states(),
         &models,
         per_model,
         capability_peers,
         &addrs,
         geo,
-    )))
+    );
+    snapshot.update_period = CRAWL_INTERVAL.as_secs();
+    snapshot.update_duration = started.elapsed().as_secs_f64();
+    Ok(Some(snapshot))
 }
 
 // ── Bootstrap health ──────────────────────────────────────────────────────────
@@ -499,8 +505,14 @@ fn build_snapshot(
                 },
                 span: PeerSpan {
                     peer_id: peer_id.clone(),
-                    start: entry.blocks.iter().next().copied().unwrap_or(0),
-                    end: entry.blocks.iter().next_back().copied().unwrap_or(0),
+                    // The node's own declared range, verbatim, which is what v1
+                    // puts here and what the page renders as "start-end". Note
+                    // `end` is EXCLUSIVE: a node serving only block 0 announces
+                    // 0..1, and the DHT holds one key for it. Deriving this from
+                    // the block keys actually seen would read 0-0 instead and
+                    // silently disagree with v1 on every row.
+                    start: entry.info.start_block,
+                    end: entry.info.end_block,
                     server_info: entry.info.clone(),
                 },
             });
@@ -535,6 +547,9 @@ fn build_snapshot(
 
     Snapshot {
         top_contributors: top_contributors(&model_reports),
+        // Filled in by the caller, which is what times the pass.
+        update_period: 0,
+        update_duration: 0.0,
         bootstrap_states,
         num_peers: all_peers.len(),
         num_blocks_covered: blocks_covered,
@@ -653,6 +668,43 @@ mod tests {
         assert_eq!(set.states(), vec!["offline", "offline"]);
     }
 
+    /// A node serving exactly one block announces 0..1 and puts one key in the
+    /// DHT. v1 renders that as "0-1"; reading the span off the observed keys
+    /// would render "0-0" and disagree with v1 on every row of every model.
+    #[test]
+    fn a_single_block_server_spans_zero_to_one() {
+        let model = Model {
+            dht_prefix: "M".into(),
+            repository: String::new(),
+            num_blocks: 32,
+        };
+        let mut peers = HashMap::new();
+        peers.insert(
+            "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG".to_string(),
+            PeerModelEntry {
+                blocks: [0].into_iter().collect(),
+                info: ServerInfo {
+                    state: "online".into(),
+                    start_block: 0,
+                    end_block: 1,
+                    ..Default::default()
+                },
+            },
+        );
+        let snapshot = build_snapshot(
+            vec!["online".into()],
+            &[model],
+            BTreeMap::from([("M".to_string(), peers)]),
+            HashMap::new(),
+            &HashMap::new(),
+            &GeoIp::from_env(),
+        );
+
+        let span = &snapshot.model_reports[0].server_rows[0].span;
+        assert_eq!((span.start, span.end), (0, 1));
+        assert_eq!(snapshot.num_blocks_covered, 1);
+    }
+
     #[test]
     fn model_name_comes_from_the_repository_url() {
         assert_eq!(
@@ -683,6 +735,9 @@ mod tests {
                 blocks: [0, 1, 2].into_iter().collect(),
                 info: ServerInfo {
                     state: "online".into(),
+                    // Half-open, as announced: blocks 0, 1 and 2.
+                    start_block: 0,
+                    end_block: 3,
                     ..Default::default()
                 },
             },
@@ -699,7 +754,10 @@ mod tests {
         let report = &snapshot.model_reports[0];
         assert_eq!(report.state, "broken");
         assert_eq!(snapshot.num_blocks_covered, 3);
-        assert_eq!(report.server_rows[0].span.end, 2);
+        // The span is the node's announced range, half-open — NOT the highest
+        // block key observed, which would read 2 here and disagree with v1.
+        assert_eq!(report.server_rows[0].span.start, 0);
+        assert_eq!(report.server_rows[0].span.end, 3);
         assert_eq!(report.server_rows[0].short_peer_id, "...WnPbdG");
     }
 
@@ -717,6 +775,8 @@ mod tests {
                 blocks: [0, 1].into_iter().collect(),
                 info: ServerInfo {
                     state: "offline".into(),
+                    start_block: 0,
+                    end_block: 2,
                     ..Default::default()
                 },
             },
