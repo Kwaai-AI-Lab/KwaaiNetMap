@@ -1,13 +1,29 @@
 # map-spa — the React landing page (hero stats, benchmark, trust graph,
-# install funnel). Buildable but NOT deployed: the map that replaces v1 has
-# to carry v1's map/table/topology views, which this page does not have.
-# See V2.md.
+# install funnel). Buildable and runnable, but NOT the map that replaces v1:
+# it has no geographic map, no node table and no topology view, so shipping it
+# alone would lose all three at the cutover. See V2.md.
 FROM node:20-slim AS builder
 WORKDIR /app
+
+# Where the built bundle looks for the API. Empty means SAME ORIGIN, which is
+# what nginx is for — it proxies /api/ to map-server, so the page works behind
+# any hostname without being rebuilt.
+#
+# It must default to empty rather than to a real host. Vite bakes this value
+# into the bundle at build time, so an absolute URL here is a fetch the
+# *browser* makes — and a browser is not inside anyone's network seal. A build
+# carrying https://map.kwaai.ai served from a test bed would have every visitor
+# reading production.
+ARG VITE_API_BASE=
+
 COPY apps/map/package.json apps/map/package-lock.json* ./
 RUN npm install
 COPY apps/map/ ./
-RUN npm run build
+
+# Overwrite rather than append: `vite build` runs in production mode and reads
+# .env.production, so a stale value there would win over the build arg.
+RUN printf 'VITE_API_BASE=%s\n' "$VITE_API_BASE" > .env.production \
+    && npm run build
 
 FROM nginx:alpine
 COPY --from=builder /app/dist /usr/share/nginx/html
