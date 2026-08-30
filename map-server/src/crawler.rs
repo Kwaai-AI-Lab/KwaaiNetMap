@@ -148,6 +148,13 @@ async fn crawl_once(
         collect_capability(handle, &our_dhtid, &mut set, key, &mut capability_peers).await;
     }
 
+    let discovered: BTreeSet<String> = per_model
+        .values()
+        .flat_map(|peers| peers.keys().cloned())
+        .chain(capability_peers.keys().cloned())
+        .collect();
+    connect_discovered_peers(handle, &discovered).await;
+
     let addrs = observed_addrs(handle).await;
     geo.warm(
         &addrs
@@ -431,11 +438,43 @@ fn servers_in(result_type: i32, value: &[u8]) -> Vec<(String, ServerInfo)> {
     }
 }
 
+/// Bound on one peer dial during the location pass.
+const PEER_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Dials run together; the pass costs one timeout, not one per unreachable peer.
+const PEER_DIAL_CONCURRENCY: usize = 8;
+
+/// Dial every discovered peer, so `observed_addrs` below has connections to
+/// read addresses from.
+///
+/// The DHT yields peer ids, never addresses, so a location can only come off
+/// a live connection. v1 dialled every server each pass as its reachability
+/// probe and read `list_peers` afterwards — its locations were a side effect
+/// of that probe, and without an equivalent every row is "Location Unknown".
+/// The bare `/p2p/<id>` dial is the routed path: Kademlia supplies whatever
+/// addresses the walk above just taught it. Failures are fine (an unreachable
+/// NATed peer stays unlocated, as on v1) and connections are left for the
+/// swarm's idle timeout to reap.
+async fn connect_discovered_peers(handle: &NetworkHandle, peer_ids: &BTreeSet<String>) {
+    use futures::StreamExt as _;
+
+    let ours = handle.local_peer_id();
+    futures::stream::iter(peer_ids.iter().filter(|id| **id != ours))
+        .for_each_concurrent(PEER_DIAL_CONCURRENCY, |peer_id| async move {
+            let addr = format!("/p2p/{peer_id}");
+            match tokio::time::timeout(PEER_DIAL_TIMEOUT, handle.connect_peer(&addr)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => debug!("location dial {peer_id}: {e}"),
+                Err(_) => debug!("location dial {peer_id}: timed out"),
+            }
+        })
+        .await;
+}
+
 /// Addresses of every peer the observer currently holds a connection to.
 ///
 /// This is the only source of peer addresses: DHT records carry peer ids, never
-/// addresses. A peer we are not connected to therefore has no location, which
-/// matches what v1 could see.
+/// addresses — which is why the crawl dials every discovered peer first.
 ///
 /// `list_peers` reports one entry per *connection*, so a peer reached more than
 /// one way appears more than once; the addresses are grouped back per peer.
