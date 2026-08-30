@@ -9,10 +9,11 @@
 FROM rust:slim AS builder
 WORKDIR /src
 
-# protoc compiles the Hivemind DHT protos; kwaai-hivemind-dht's build script
-# would otherwise download one.
+# protoc compiles the Hivemind DHT protos. curl and patch are for
+# patches/fetch-multistream-select.sh below — rust:slim has neither, and the
+# script fails with exit 127 without them.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      pkg-config protobuf-compiler ca-certificates \
+      pkg-config protobuf-compiler curl patch ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY map-server/ ./map-server/
