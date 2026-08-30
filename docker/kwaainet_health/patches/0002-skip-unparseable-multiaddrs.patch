@@ -1,0 +1,42 @@
+Subject: skip multiaddrs the bundled multiaddr library cannot render
+
+fetch_health_state stringifies every address of every peer in one dict
+comprehension. The pinned python multiaddr library predates newer libp2p
+protocols -- protocol code 461 (quic-v1) in particular -- and its __str__
+raises BinaryParseError on any address that uses one. A single peer on the
+DHT announcing a quic-v1 address therefore killed the whole state fetch,
+every cycle, and the map served nothing (observed on map.kwaai.ai
+2026-08-30; hotfixed live in the running container the same day -- this
+patch is the durable copy of that fix).
+
+Render each address individually and drop the ones that fail; drop a peer
+entirely only if none of its addresses render. Peers keep their location
+(derived from the first renderable address rather than blindly addrs[0])
+and the map keeps running; the only loss is that exotic addresses are not
+displayed, which the old library could not do anyway.
+
+---
+index 42154a6..6cbba15 100644
+--- a/health.py
++++ b/health.py
+@@ -71,7 +71,19 @@ def fetch_health_state(dht: hivemind.DHT) -> dict:
+     online_servers = [peer_id for peer_id, span in all_servers.items() if span.state == ServerState.ONLINE]
+ 
+     reach_infos.update(dht.run_coroutine(partial(check_reachability_parallel, online_servers, fetch_info=True)))
+-    peers_info = {str(peer.peer_id): {"location": extract_peer_ip_info(str(peer.addrs[0])), "multiaddrs": [str(multiaddr) for multiaddr in peer.addrs]} for peer in dht.run_coroutine(get_peers_ips)}
++    peers_info = {}
++    for peer in dht.run_coroutine(get_peers_ips):
++        addrs = []
++        for multiaddr in peer.addrs:
++            # This multiaddr library predates newer protocols (e.g. 461 = quic-v1)
++            # and str() raises BinaryParseError on addresses that use them.
++            try:
++                addrs.append(str(multiaddr))
++            except Exception:
++                continue
++        if not addrs:
++            continue
++        peers_info[str(peer.peer_id)] = {"location": extract_peer_ip_info(addrs[0]), "multiaddrs": addrs}
+ 
+     top_contributors = Counter()
+     model_reports = []

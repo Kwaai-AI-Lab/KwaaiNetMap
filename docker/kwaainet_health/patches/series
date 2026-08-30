@@ -1,1 +1,2 @@
 0001-normalise-bytes-dht_prefix.patch
+0002-skip-unparseable-multiaddrs.patch
