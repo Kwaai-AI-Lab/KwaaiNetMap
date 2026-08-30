@@ -7,7 +7,7 @@ name: Build map images
 
 on:
   push:
-    branches: [map-v2]
+    branches: [main]
     paths:
       - "map-server/**"
       - "docker/**"
@@ -84,7 +84,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-,format=short
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/map-v2' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
       - uses: docker/setup-buildx-action@v3
 

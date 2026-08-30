@@ -1,11 +1,12 @@
 # KwaaiNetMap
 
-> **This branch (`map-v2`) is the native-KwaaiNet map.** The v1 service
-> described below still lives here under `docker/kwaainet_health/` and still
-> serves `map.kwaai.ai` from `main` — it is not being removed. What is new is a
-> Rust API that crawls the DHT over **rust-libp2p in process**, rather than the
-> Python petals/hivemind stack and the standalone Go `p2pd` it forks. It serves
-> the same three views and the same `/api/v1/state` contract. See
+> **This repo carries both map generations.** The v1 service described below
+> (`docker/kwaainet_health/`) is what serves `map.kwaai.ai` today. The v2 map
+> (`map-server/` + `Dockerfile.map-*`) is its replacement: a Rust API that
+> crawls the DHT over **rust-libp2p in process** rather than the Python
+> petals/hivemind stack and the standalone Go `p2pd` it forks, serving the
+> same three views and the same `/api/v1/state` contract. v2 deploys to
+> `kwaaimap2` via KwaaiNetOps; the cutover is a DNS change. See
 > **[V2.md](V2.md)**.
 
 The KwaaiNet network map — a web service that crawls the KwaaiNet DHT and publishes what it finds,
