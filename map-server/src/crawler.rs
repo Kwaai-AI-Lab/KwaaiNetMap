@@ -439,7 +439,11 @@ fn servers_in(result_type: i32, value: &[u8]) -> Vec<(String, ServerInfo)> {
 }
 
 /// Bound on one peer dial during the location pass.
-const PEER_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
+/// 15s, not v1's 5: a relay handshake through a loaded bootstrap can take
+/// longer than a plain TCP connect, and a missed dial blanks the peer's
+/// location for a whole crawl. Worst case this pass costs
+/// ceil(peers / PEER_DIAL_CONCURRENCY) x 15s of the 60s crawl interval.
+const PEER_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Dials run together; the pass costs one timeout, not one per unreachable peer.
 const PEER_DIAL_CONCURRENCY: usize = 8;
