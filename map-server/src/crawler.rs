@@ -24,10 +24,10 @@ use tracing::{debug, info, warn};
 
 use crate::cache::{NodeCache, NodeEntry};
 use crate::dht::{decode_model_registry, decode_server_info, dht_key, dictionary_entries};
-use crate::geoip::{public_ips, relay_dns_names, GeoIp};
+use crate::geoip::{public_ips, relay_dns_names, relay_peer_id_of, via_relay_at, GeoIp};
 use crate::snapshot::{
-    short_peer_id, Contributor, ModelReport, PeerIpInfo, PeerSpan, ReachabilityIssue, ServerInfo,
-    ServerRow, Snapshot,
+    short_peer_id, Contributor, Location, ModelReport, PeerIpInfo, PeerSpan, ReachabilityIssue,
+    ServerInfo, ServerRow, Snapshot,
 };
 
 /// The `_petals.models` registry names the models actually on the network.
@@ -499,6 +499,26 @@ async fn observed_addrs(handle: &NetworkHandle) -> HashMap<String, Vec<String>> 
 
 // ── Snapshot assembly ─────────────────────────────────────────────────────────
 
+/// A row's location, with one fallback geoip alone cannot provide: a peer
+/// relayed through another *node* often records the relay hop by that node's
+/// LAN address (a node relaying from behind its own NAT), which geolocates to
+/// nothing — but the relay is usually a peer this crawl already located, so
+/// the row borrows its relay's coordinates by peer id.
+fn locate_row(geo: &GeoIp, peer_addrs: &[String], known: &HashMap<String, Location>) -> Location {
+    let loc = geo.locate(peer_addrs);
+    if loc.status == "success" || !peer_addrs.iter().any(|a| a.contains("/p2p-circuit")) {
+        return loc;
+    }
+    peer_addrs
+        .iter()
+        .find_map(|a| {
+            let relay = known.get(&relay_peer_id_of(a)?)?;
+            (relay.status == "success" && (relay.lat, relay.lon) != (0.0, 0.0))
+                .then(|| via_relay_at(relay.clone()))
+        })
+        .unwrap_or(loc)
+}
+
 fn build_snapshot(
     bootstrap_states: Vec<String>,
     models: &[Model],
@@ -511,6 +531,13 @@ fn build_snapshot(
     let mut all_peers: BTreeSet<String> = BTreeSet::new();
     let mut blocks_covered = 0usize;
     let mut issues = Vec::new();
+
+    // Every connected peer's own location, keyed by peer id, so a peer
+    // relayed through another *node* can borrow its relay's pin.
+    let known: HashMap<String, Location> = addrs
+        .iter()
+        .map(|(id, a)| (id.clone(), geo.locate(a)))
+        .collect();
 
     for model in models {
         let Some(peers) = per_model.get(&model.dht_prefix) else {
@@ -540,7 +567,7 @@ fn build_snapshot(
                 show_public_name: entry.info.public_name.is_some(),
                 state: entry.info.state.clone(),
                 peer_ip_info: PeerIpInfo {
-                    location: geo.locate(&peer_addrs),
+                    location: locate_row(geo, &peer_addrs, &known),
                     multiaddrs: peer_addrs,
                 },
                 span: PeerSpan {
@@ -680,6 +707,40 @@ fn tier_from_vc_count(count: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_peer_relayed_through_a_known_node_borrows_its_pin() {
+        // Seen live: a node relaying from behind its own NAT records the
+        // relay hop by LAN address, which geolocates to nothing — but the
+        // relay itself is a located peer in the same crawl.
+        let geo = GeoIp::from_env();
+        let relay_id = "12D3KooWRelay".to_string();
+        let circuit = vec![format!(
+            "/ip4/192.168.0.198/tcp/8080/p2p/{relay_id}/p2p-circuit/p2p/12D3KooWPeer"
+        )];
+
+        let mut known = HashMap::new();
+        known.insert(
+            relay_id,
+            Location {
+                status: "success".into(),
+                country: "United States".into(),
+                city: "Phoenix".into(),
+                lat: 33.4,
+                lon: -112.1,
+                isp: "Cox".into(),
+            },
+        );
+        let loc = locate_row(&geo, &circuit, &known);
+        assert_eq!(loc.status, "success");
+        assert_eq!(loc.city, "Via relay");
+        assert_eq!((loc.lat, loc.lon), (33.4, -112.1));
+
+        // No known relay: the sentinel must NOT be a "success" at (0,0) —
+        // that is the page's cue to pin a peer in the ocean.
+        let loc = locate_row(&geo, &circuit, &HashMap::new());
+        assert_eq!(loc.status, "fail");
+    }
 
     #[test]
     fn a_dialable_bootstrap_is_not_online_until_it_answers() {

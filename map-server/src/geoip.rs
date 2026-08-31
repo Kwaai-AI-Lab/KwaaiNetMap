@@ -193,7 +193,7 @@ impl GeoIp {
 
 /// "Via relay", pinned at the relay's coordinates. An unresolved relay falls
 /// back to the plain sentinel rather than claiming (0,0) was looked up.
-fn via_relay_at(relay: Location) -> Location {
+pub fn via_relay_at(relay: Location) -> Location {
     if relay.status != "success" {
         return Location::via_relay();
     }
@@ -234,6 +234,17 @@ pub fn relay_dns_names(addrs: &[String]) -> Vec<String> {
 fn relay_ip_of(addr: &str) -> Option<String> {
     let (relay_part, _) = addr.split_once("/p2p-circuit")?;
     public_ip_of(relay_part)
+}
+
+/// The relay's peer id out of a circuit address — the last /p2p/ hop before
+/// /p2p-circuit. A relay whose transport address is unusable (a node relaying
+/// from behind its own NAT records a LAN hop) can still be a peer the crawl
+/// located by other means.
+pub fn relay_peer_id_of(addr: &str) -> Option<String> {
+    let (relay_part, _) = addr.split_once("/p2p-circuit")?;
+    relay_part
+        .rsplit_once("/p2p/")
+        .map(|(_, id)| id.to_string())
 }
 
 /// The relay's DNS name out of a circuit address, when it is named not

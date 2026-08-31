@@ -83,9 +83,15 @@ impl Location {
 
     /// The fallback when a relayed peer's relay could not itself be located;
     /// normally geoip pins "Via relay" at the relay's own coordinates.
+    ///
+    /// `status: "fail"`, deliberately: v1 called this "success" with lat/lon
+    /// 0, and the page pins every "success" at its coordinates — which put
+    /// relayed peers in the ocean at (0,0). A failed status keeps them in
+    /// the page's Location Unknown bucket instead; the Connection Type
+    /// column still says Relay.
     pub fn via_relay() -> Self {
         Self {
-            status: "success".into(),
+            status: "fail".into(),
             country: "Unknown".into(),
             city: "Via relay".into(),
             lat: 0.0,
