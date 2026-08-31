@@ -134,25 +134,59 @@ impl GeoIp {
 
     /// Where to pin a peer, given every address we have seen it on.
     ///
-    /// A circuit address carries the relay's IP, so it never contributes a
-    /// location: a peer reachable only through a relay is "Via relay" rather
-    /// than pinned at whichever bootstrap is relaying it.
+    /// A circuit address carries the relay's IP, so it never yields the
+    /// peer's own location. It does place a pin: a relay-only peer borrows
+    /// the relay's coordinates so it appears near its relay on the map
+    /// instead of at the (0,0) sentinel, while the "Via relay" label keeps
+    /// the popup honest about whose city that is.
     pub fn locate(&self, addrs: &[String]) -> Location {
-        match first_public_ip(addrs) {
-            Some(ip) => self.cached(&ip),
+        if let Some(ip) = first_public_ip(addrs) {
+            return self.cached(&ip);
+        }
+        match first_relay_ip(addrs) {
+            Some(relay_ip) => via_relay_at(self.cached(&relay_ip)),
             None if addrs.iter().any(|a| a.contains("/p2p-circuit")) => Location::via_relay(),
             None => Location::unknown(),
         }
     }
 }
 
-/// The public IPs worth asking about, across every peer's addresses.
+/// "Via relay", pinned at the relay's coordinates. An unresolved relay falls
+/// back to the plain sentinel rather than claiming (0,0) was looked up.
+fn via_relay_at(relay: Location) -> Location {
+    if relay.status != "success" {
+        return Location::via_relay();
+    }
+    Location {
+        city: "Via relay".to_string(),
+        isp: format!("Relay: {}", relay.isp),
+        ..relay
+    }
+}
+
+/// The public IPs worth asking about, across every peer's addresses — the
+/// peers' own, plus relay IPs so a relayed peer's borrowed pin resolves too.
 pub fn public_ips(addrs: &[String]) -> Vec<String> {
-    addrs.iter().filter_map(|a| public_ip_of(a)).collect()
+    addrs
+        .iter()
+        .filter_map(|a| public_ip_of(a))
+        .chain(addrs.iter().filter_map(|a| relay_ip_of(a)))
+        .collect()
 }
 
 fn first_public_ip(addrs: &[String]) -> Option<String> {
     addrs.iter().find_map(|a| public_ip_of(a))
+}
+
+fn first_relay_ip(addrs: &[String]) -> Option<String> {
+    addrs.iter().find_map(|a| relay_ip_of(a))
+}
+
+/// The relay's IP out of a circuit address: the transport before
+/// `/p2p-circuit` is how we reach the relay, and its IP locates the relay.
+fn relay_ip_of(addr: &str) -> Option<String> {
+    let (relay_part, _) = addr.split_once("/p2p-circuit")?;
+    public_ip_of(relay_part)
 }
 
 /// The IP of one multiaddr, if it is a directly dialable public address.
@@ -222,6 +256,35 @@ mod tests {
     fn a_circuit_address_yields_no_ip() {
         let circuit = "/ip4/93.184.216.34/tcp/8000/p2p/QmRelay/p2p-circuit/p2p/QmPeer";
         assert_eq!(public_ip_of(circuit), None);
+    }
+
+    #[test]
+    fn the_relay_ip_comes_out_of_a_circuit_address() {
+        let circuit = "/ip4/93.184.216.34/tcp/8000/p2p/QmRelay/p2p-circuit/p2p/QmPeer";
+        assert_eq!(relay_ip_of(circuit), Some("93.184.216.34".to_string()));
+        assert_eq!(
+            relay_ip_of("/ip4/93.184.216.34/tcp/8000/p2p/QmDirect"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_located_relay_lends_its_coordinates_but_not_its_name() {
+        let relay = Location {
+            status: "success".into(),
+            country: "United States".into(),
+            city: "Ashburn".into(),
+            lat: 39.0,
+            lon: -77.5,
+            isp: "AWS".into(),
+        };
+        let loc = via_relay_at(relay);
+        assert_eq!(loc.city, "Via relay");
+        assert_eq!(loc.country, "United States");
+        assert_eq!(loc.lat, 39.0);
+        assert_eq!(loc.isp, "Relay: AWS");
+        // An unresolved relay keeps the plain sentinel, not a fake (0,0) fix.
+        assert_eq!(via_relay_at(Location::unknown()).country, "Unknown");
     }
 
     #[test]

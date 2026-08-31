@@ -81,8 +81,8 @@ impl Location {
         }
     }
 
-    /// A relay circuit carries the *relay's* IP, not the peer's, so it gets a
-    /// sentinel rather than a pin at someone else's location.
+    /// The fallback when a relayed peer's relay could not itself be located;
+    /// normally geoip pins "Via relay" at the relay's own coordinates.
     pub fn via_relay() -> Self {
         Self {
             status: "success".into(),
