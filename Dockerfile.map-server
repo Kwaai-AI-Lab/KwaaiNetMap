@@ -10,7 +10,7 @@ FROM rust:slim AS builder
 WORKDIR /src
 
 # protoc compiles the Hivemind DHT protos. curl and patch are for
-# patches/fetch-multistream-select.sh below — rust:slim has neither, and the
+# patches/fetch-patches.sh below — rust:slim has neither, and the
 # script fails with exit 127 without them.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       pkg-config protobuf-compiler curl patch ca-certificates \
@@ -22,7 +22,7 @@ WORKDIR /src/map-server
 # Must run before cargo touches the manifest: `[patch.crates-io]` points at a
 # path that this script produces, so cargo cannot even parse Cargo.toml until
 # it has. See patches/README.md for why the patch is needed at all.
-RUN bash patches/fetch-multistream-select.sh
+RUN bash patches/fetch-patches.sh
 
 RUN cargo build --release
 

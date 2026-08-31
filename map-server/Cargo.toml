@@ -2,11 +2,14 @@
 # libp2p protocol IDs. Upstream multistream-select rejects any name without a
 # leading `/`, so without this every rpc_find fails dialer-side with
 # "A protocol (name) is invalid" — and an empty crawl is indistinguishable from
-# an empty network, so the map would serve a plausible lie. Run
-# `bash patches/fetch-multistream-select.sh` before the first build; cargo
-# cannot parse this manifest until the patched source exists.
+# an empty network, so the map would serve a plausible lie. libp2p-kad restores
+# the multi-protocol-names setter kwaai-p2p uses for the /kwaai/kad/1.0.0
+# migration (kwaai-p2p ≥ 0.6.5 does not compile without it). Run
+# `bash patches/fetch-patches.sh` before the first build; cargo cannot parse
+# this manifest until the patched sources exist.
 [patch.crates-io]
 multistream-select = { path = "patches/multistream-select" }
+libp2p-kad = { path = "patches/libp2p-kad" }
 
 [package]
 name = "map-server"

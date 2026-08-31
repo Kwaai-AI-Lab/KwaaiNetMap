@@ -43,7 +43,7 @@ jobs:
       # produces, so the manifest will not parse without it.
       - name: Fetch and patch multistream-select
         working-directory: map-server
-        run: bash patches/fetch-multistream-select.sh
+        run: bash patches/fetch-patches.sh
       - name: Check formatting
         working-directory: map-server
         run: cargo fmt --check

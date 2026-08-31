@@ -1,8 +1,25 @@
 # patches/
 
 Build-time patched dependencies. Nothing here is vendored source: only the
-patch file and a checksum-pinned fetch script are committed; the expanded crate
-is produced locally and gitignored.
+patch files and checksum-pinned fetch scripts are committed; the expanded
+crates are produced locally and gitignored.
+
+`fetch-patches.sh` is the single entry point — it runs every per-crate fetch
+script and is what the Dockerfile and CI call.
+
+## libp2p-kad (multi-protocol names)
+
+`libp2p-kad 0.48.0` (from rust-libp2p, MIT) with one API restoration, applied
+via `[patch.crates-io]` in `map-server/Cargo.toml`: the public
+`set_protocol_names` setter upstream removed in its `Config::default()`
+deprecation sweep. kwaai-p2p (≥ 0.6.5) uses it to negotiate
+`/kwaai/kad/1.0.0` alongside the legacy `/ipfs/kad/1.0.0` — the migration
+that keeps publicly reachable KwaaiNet nodes out of the global IPFS DHT's
+routing tables — so this crate does not compile against those versions
+without the patch. Same patch, same reason to repeat it here as
+multistream-select below: `[patch.crates-io]` applies only to a build's root
+manifest. Copy of KwaaiNet's `core/patches/libp2p-kad.patch`; the two must
+not diverge.
 
 ## multistream-select (slash-less protocol IDs)
 
@@ -26,14 +43,14 @@ crate is built standalone rather than inside that workspace.
 
 ### Fresh checkout
 
-Cargo cannot parse the manifest until the patched source exists:
+Cargo cannot parse the manifest until the patched sources exist:
 
 ```sh
-bash map-server/patches/fetch-multistream-select.sh
+bash map-server/patches/fetch-patches.sh
 ```
 
-`Dockerfile.map-server` and the CI workflow run it automatically. The script
-pins the crates.io tarball by sha256 and is a no-op once the source is present
+`Dockerfile.map-server` and the CI workflow run it automatically. Each script
+pins its crates.io tarball by sha256 and is a no-op once the source is present
 and matches the patch.
 
 ### Keeping it in step
