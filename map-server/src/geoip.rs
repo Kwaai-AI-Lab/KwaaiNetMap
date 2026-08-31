@@ -42,6 +42,9 @@ struct ApiEntry {
 
 pub struct GeoIp {
     cache: Arc<DashMap<String, Location>>,
+    /// Relay DNS name → resolved public IP. Successes only: relays are
+    /// stable, a failed lookup is retried next crawl.
+    dns: Arc<DashMap<String, String>>,
     client: reqwest::Client,
     endpoint: String,
     enabled: bool,
@@ -60,6 +63,7 @@ impl GeoIp {
 
         Self {
             cache: Arc::new(DashMap::new()),
+            dns: Arc::new(DashMap::new()),
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
@@ -143,11 +147,47 @@ impl GeoIp {
         if let Some(ip) = first_public_ip(addrs) {
             return self.cached(&ip);
         }
-        match first_relay_ip(addrs) {
-            Some(relay_ip) => via_relay_at(self.cached(&relay_ip)),
+        let relay_ip = first_relay_ip(addrs).or_else(|| {
+            addrs
+                .iter()
+                .find_map(|a| relay_dns_of(a).and_then(|n| self.dns.get(&n).map(|e| e.clone())))
+        });
+        match relay_ip {
+            Some(ip) => via_relay_at(self.cached(&ip)),
             None if addrs.iter().any(|a| a.contains("/p2p-circuit")) => Location::via_relay(),
             None => Location::unknown(),
         }
+    }
+
+    /// Resolve relay DNS names to IPs, returning every IP now known for
+    /// `names` so the caller can warm them. Disabled deployments do no
+    /// lookups at all — the sealed test bed stays silent.
+    pub async fn resolve_relays(&self, names: &[String]) -> Vec<String> {
+        let mut pending: Vec<&String> = names.iter().collect();
+        pending.sort();
+        pending.dedup();
+
+        let mut out = Vec::new();
+        for name in pending {
+            if let Some(ip) = self.dns.get(name) {
+                out.push(ip.clone());
+                continue;
+            }
+            if !self.enabled {
+                continue;
+            }
+            match tokio::net::lookup_host((name.as_str(), 0)).await {
+                Ok(resolved) => {
+                    if let Some(ip) = resolved.map(|sa| sa.ip()).find(is_public) {
+                        let ip = ip.to_string();
+                        self.dns.insert(name.clone(), ip.clone());
+                        out.push(ip);
+                    }
+                }
+                Err(e) => debug!("relay dns {name}: {e}"),
+            }
+        }
+        out
     }
 }
 
@@ -182,11 +222,31 @@ fn first_relay_ip(addrs: &[String]) -> Option<String> {
     addrs.iter().find_map(|a| relay_ip_of(a))
 }
 
+/// DNS names of relays across every peer's addresses — relays are as often
+/// named as numbered (kubo's AutoTLS names under libp2p.direct, our
+/// bootstraps' /dns/ forms), and a name geolocates only once resolved.
+pub fn relay_dns_names(addrs: &[String]) -> Vec<String> {
+    addrs.iter().filter_map(|a| relay_dns_of(a)).collect()
+}
+
 /// The relay's IP out of a circuit address: the transport before
 /// `/p2p-circuit` is how we reach the relay, and its IP locates the relay.
 fn relay_ip_of(addr: &str) -> Option<String> {
     let (relay_part, _) = addr.split_once("/p2p-circuit")?;
     public_ip_of(relay_part)
+}
+
+/// The relay's DNS name out of a circuit address, when it is named not
+/// numbered.
+fn relay_dns_of(addr: &str) -> Option<String> {
+    let (relay_part, _) = addr.split_once("/p2p-circuit")?;
+    let mut parts = relay_part.split('/').skip(1);
+    while let Some(proto) = parts.next() {
+        if matches!(proto, "dns" | "dns4" | "dns6" | "dnsaddr") {
+            return parts.next().map(str::to_string);
+        }
+    }
+    None
 }
 
 /// The IP of one multiaddr, if it is a directly dialable public address.
@@ -256,6 +316,25 @@ mod tests {
     fn a_circuit_address_yields_no_ip() {
         let circuit = "/ip4/93.184.216.34/tcp/8000/p2p/QmRelay/p2p-circuit/p2p/QmPeer";
         assert_eq!(public_ip_of(circuit), None);
+    }
+
+    #[test]
+    fn a_named_relay_yields_its_dns_name() {
+        // kubo's AutoTLS shape, seen live: peers relayed through named relays
+        // rendered at (0,0) because only ip4 relay parts were recognised.
+        let autotls =
+            "/dns4/140-99-164-63.k51abc.libp2p.direct/tcp/4001/tls/ws/p2p-circuit/p2p/12D3KooWPeer";
+        assert_eq!(
+            relay_dns_of(autotls),
+            Some("140-99-164-63.k51abc.libp2p.direct".to_string())
+        );
+        let bootstrap = "/dns/bootstrap-1.kwaai.ai/tcp/8000/p2p/QmRelay/p2p-circuit/p2p/QmPeer";
+        assert_eq!(
+            relay_dns_of(bootstrap),
+            Some("bootstrap-1.kwaai.ai".to_string())
+        );
+        // Not a circuit: the name is the peer's own, not a relay's.
+        assert_eq!(relay_dns_of("/dns4/node.example.com/tcp/8000"), None);
     }
 
     #[test]

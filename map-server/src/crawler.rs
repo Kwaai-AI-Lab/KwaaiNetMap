@@ -24,7 +24,7 @@ use tracing::{debug, info, warn};
 
 use crate::cache::{NodeCache, NodeEntry};
 use crate::dht::{decode_model_registry, decode_server_info, dht_key, dictionary_entries};
-use crate::geoip::{public_ips, GeoIp};
+use crate::geoip::{public_ips, relay_dns_names, GeoIp};
 use crate::snapshot::{
     short_peer_id, Contributor, ModelReport, PeerIpInfo, PeerSpan, ReachabilityIssue, ServerInfo,
     ServerRow, Snapshot,
@@ -156,13 +156,10 @@ async fn crawl_once(
     connect_discovered_peers(handle, &discovered).await;
 
     let addrs = observed_addrs(handle).await;
-    geo.warm(
-        &addrs
-            .values()
-            .flat_map(|a| public_ips(a))
-            .collect::<Vec<_>>(),
-    )
-    .await;
+    let flat: Vec<String> = addrs.values().flatten().cloned().collect();
+    let mut ips = public_ips(&flat);
+    ips.extend(geo.resolve_relays(&relay_dns_names(&flat)).await);
+    geo.warm(&ips).await;
 
     let mut snapshot = build_snapshot(
         set.states(),
