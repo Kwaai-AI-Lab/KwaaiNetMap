@@ -434,6 +434,11 @@
             font-weight: bold;
         }
 
+        .status-unreachable {
+            color: #c0392b;
+            font-weight: bold;
+        }
+
         .status-unknown {
             color: #777;
             font-weight: bold;
@@ -895,7 +900,9 @@
         // inference, not connectivity: a peer only appears here at all because it
         // announced into the DHT within the record TTL. `offline` is a departure
         // (a shutdown announcement or the -1 tombstone), not an unreachable node.
-        const STATUS_LABELS = { online: 'Sharding', joining: 'Ready', offline: 'Departed' };
+        // `unreachable` is v1-only: its health service overrides the announced
+        // state when its own probe of an ONLINE server fails.
+        const STATUS_LABELS = { online: 'Sharding', joining: 'Ready', offline: 'Departed', unreachable: 'Unreachable' };
         const statusLabel = (state) => STATUS_LABELS[state] || 'Unknown';
         const statusClass = (state) => `status-${STATUS_LABELS[state] ? state : 'unknown'}`;
 
@@ -918,7 +925,7 @@
                     }
 
                     // Color markers based on status
-                    let markerColor = { online: 'green', joining: 'orange' }[server.state] || 'grey';
+                    let markerColor = { online: 'green', joining: 'orange', unreachable: 'red' }[server.state] || 'grey';
                     let markerIcon = L.icon({
                         iconUrl: `https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-${markerColor}.png`,
                         iconSize: [25, 41],
