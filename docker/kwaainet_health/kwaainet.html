@@ -424,8 +424,18 @@
             font-weight: bold;
         }
 
+        .status-joining {
+            color: #b8860b;
+            font-weight: bold;
+        }
+
         .status-offline {
             color: red;
+            font-weight: bold;
+        }
+
+        .status-unknown {
+            color: #777;
             font-weight: bold;
         }
 
@@ -881,6 +891,14 @@
             }
         }
 
+        // Wire states are Petals' ServerState, which is about readiness to serve
+        // inference, not connectivity: a peer only appears here at all because it
+        // announced into the DHT within the record TTL. `offline` is a departure
+        // (a shutdown announcement or the -1 tombstone), not an unreachable node.
+        const STATUS_LABELS = { online: 'Sharding', joining: 'Ready', offline: 'Departed' };
+        const statusLabel = (state) => STATUS_LABELS[state] || 'Unknown';
+        const statusClass = (state) => `status-${STATUS_LABELS[state] ? state : 'unknown'}`;
+
         // Map View Logic
         function updateMapView(data) {
             markers.clearLayers();
@@ -900,7 +918,7 @@
                     }
 
                     // Color markers based on status
-                    let markerColor = server.state === "online" ? 'green' : 'red';
+                    let markerColor = { online: 'green', joining: 'orange' }[server.state] || 'grey';
                     let markerIcon = L.icon({
                         iconUrl: `https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-${markerColor}.png`,
                         iconSize: [25, 41],
@@ -928,6 +946,7 @@
                     let marker = L.marker([lat, lon], { icon: markerIcon });
                     let popupContent = `
                         <b>Model:</b> ${report.name}<br>
+                        <b>Status:</b> <span class="${statusClass(server.state)}">${statusLabel(server.state)}</span><br>
                         <b>Location:</b> ${locationInfo}<br>
                         <b>Public Name:</b> ${publicName}<br>
                         <b>Blocks:</b> ${blocks}<br>
@@ -1040,7 +1059,7 @@
                 
                 // Status
                 const stateCell = document.createElement('td');
-                stateCell.innerHTML = `<span class="${rowData.state === 'online' ? 'status-online' : 'status-offline'}">${rowData.state}</span>`;
+                stateCell.innerHTML = `<span class="${statusClass(rowData.state)}">${statusLabel(rowData.state)}</span>`;
                 row.appendChild(stateCell);
                 
                 // Location
@@ -1343,12 +1362,12 @@
                         id: serverId,
                         label: nodeLabel,
                         group: modelName,
-                        status: server.state,
+                        status: statusLabel(server.state),
                         location: locationInfo,
                         throughput: throughput ? throughput.toFixed(2) : "N/A",
                         connectionType: connectionType,
                         blocks: blocks,
-                        title: `Model: ${modelName}<br>Status: ${server.state}<br>Location: ${locationInfo}<br>Blocks: ${blocks}`,
+                        title: `Model: ${modelName}<br>Status: ${statusLabel(server.state)}<br>Location: ${locationInfo}<br>Blocks: ${blocks}`,
                         borderWidth: 2,
                         level: 2,
                         // Different shape based on connection type
@@ -1356,7 +1375,7 @@
                         // Different color shade based on status
                         color: {
                             background: server.state === 'online' ? modelColors[modelName] : '#d3d3d3',
-                            border: server.state === 'online' ? modelColors[modelName] : '#a9a9a9'
+                            border: server.state === 'offline' ? '#a9a9a9' : modelColors[modelName]
                         },
                         // Size based on throughput
                         size: throughput ? Math.min(20 + (throughput / 50), 40) : 20
@@ -1556,7 +1575,7 @@
                 bootstrapStates.forEach(state => {
                     const dot = document.createElement('span');
                     dot.className = `status-dot ${state === 'online' ? 'online' : 'offline'}`;
-                    dot.title = `Bootstrap node: ${state}`;
+                    dot.title = `Bootstrap node: ${state === 'online' ? 'Up' : 'Down'}`;
                     statusContainer.appendChild(dot);
                 });
             }
