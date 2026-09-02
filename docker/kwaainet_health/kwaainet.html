@@ -901,7 +901,9 @@
         // announced into the DHT within the record TTL. `offline` is a departure
         // (a shutdown announcement or the -1 tombstone), not an unreachable node.
         // `unreachable` is v1-only: its health service overrides the announced
-        // state when its own probe of an ONLINE server fails.
+        // state when its own probe of an ONLINE server fails. Departed is v2-only
+        // for the same kind of reason — hivemind drops a record carrying the -1
+        // tombstone rather than decoding it, so v1 never sees one.
         const STATUS_LABELS = { online: 'Sharding', joining: 'Ready', offline: 'Departed', unreachable: 'Unreachable' };
         const statusLabel = (state) => STATUS_LABELS[state] || 'Unknown';
         const statusClass = (state) => `status-${STATUS_LABELS[state] ? state : 'unknown'}`;
@@ -1066,7 +1068,7 @@
                 
                 // Status
                 const stateCell = document.createElement('td');
-                stateCell.innerHTML = `<span class="${statusClass(rowData.state)}">${statusLabel(rowData.state)}</span>`;
+                stateCell.innerHTML = `<span class="${statusClass(rowData.stateKey)}">${rowData.state}</span>`;
                 row.appendChild(stateCell);
                 
                 // Location
@@ -1535,7 +1537,11 @@
                         peerId: server.peer_id || "",
                         blocks: blocks,
                         throughput: throughput ? throughput.toFixed(2) : "N/A",
-                        state: server.state,
+                        // The label is the row's value so the Status column
+                        // sorts and the search box matches on what is displayed;
+                        // the wire value rides along for the colour class.
+                        state: statusLabel(server.state),
+                        stateKey: server.state,
                         connectionType: connectionType
                     });
                 });
