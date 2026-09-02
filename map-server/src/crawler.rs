@@ -153,7 +153,7 @@ async fn crawl_once(
         .flat_map(|peers| peers.keys().cloned())
         .chain(capability_peers.keys().cloned())
         .collect();
-    connect_discovered_peers(handle, &discovered).await;
+    let dial_errors = connect_discovered_peers(handle, &discovered).await;
 
     let addrs = observed_addrs(handle).await;
     let flat: Vec<String> = addrs.values().flatten().cloned().collect();
@@ -167,6 +167,7 @@ async fn crawl_once(
         per_model,
         capability_peers,
         &addrs,
+        &dial_errors,
         geo,
     );
     snapshot.update_period = CRAWL_INTERVAL.as_secs();
@@ -446,30 +447,47 @@ const PEER_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 const PEER_DIAL_CONCURRENCY: usize = 8;
 
 /// Dial every discovered peer, so `observed_addrs` below has connections to
-/// read addresses from.
+/// read addresses from, and return why each failed dial failed.
 ///
 /// The DHT yields peer ids, never addresses, so a location can only come off
 /// a live connection. v1 dialled every server each pass as its reachability
 /// probe and read `list_peers` afterwards — its locations were a side effect
 /// of that probe, and without an equivalent every row is "Location Unknown".
 /// The bare `/p2p/<id>` dial is the routed path: Kademlia supplies whatever
-/// addresses the walk above just taught it. Failures are fine (an unreachable
-/// NATed peer stays unlocated, as on v1) and connections are left for the
-/// swarm's idle timeout to reap.
-async fn connect_discovered_peers(handle: &NetworkHandle, peer_ids: &BTreeSet<String>) {
+/// addresses the walk above just taught it. Failures leave the peer unlocated,
+/// as on v1, and connections are left for the swarm's idle timeout to reap.
+///
+/// The failures are also the only real connectivity signal in the crawl, which
+/// is what `reachability_issues` reports — hence the return value rather than
+/// inferring it from a peer's absence from `list_peers`, where an idle-timeout
+/// reap between the dial and the listing would read as unreachable.
+async fn connect_discovered_peers(
+    handle: &NetworkHandle,
+    peer_ids: &BTreeSet<String>,
+) -> BTreeMap<String, String> {
     use futures::StreamExt as _;
 
     let ours = handle.local_peer_id();
-    futures::stream::iter(peer_ids.iter().filter(|id| **id != ours))
-        .for_each_concurrent(PEER_DIAL_CONCURRENCY, |peer_id| async move {
+    // Owned ids, not borrows of the set: an async block capturing `&String`
+    // from the iterator cannot satisfy the higher-ranked bound `buffer_unordered`
+    // needs.
+    let targets: Vec<String> = peer_ids.iter().filter(|id| **id != ours).cloned().collect();
+    futures::stream::iter(targets)
+        .map(|peer_id| async move {
             let addr = format!("/p2p/{peer_id}");
-            match tokio::time::timeout(PEER_DIAL_TIMEOUT, handle.connect_peer(&addr)).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => debug!("location dial {peer_id}: {e}"),
-                Err(_) => debug!("location dial {peer_id}: timed out"),
-            }
+            let err =
+                match tokio::time::timeout(PEER_DIAL_TIMEOUT, handle.connect_peer(&addr)).await {
+                    Ok(Ok(_)) => return None,
+                    Ok(Err(e)) => e.to_string(),
+                    Err(_) => format!("dial timed out after {}s", PEER_DIAL_TIMEOUT.as_secs()),
+                };
+            debug!("location dial {peer_id}: {err}");
+            Some((peer_id, err))
         })
-        .await;
+        .buffer_unordered(PEER_DIAL_CONCURRENCY)
+        .filter_map(|r| async move { r })
+        .collect()
+        .await
 }
 
 /// Addresses of every peer the observer currently holds a connection to.
@@ -525,12 +543,14 @@ fn build_snapshot(
     per_model: BTreeMap<String, HashMap<String, PeerModelEntry>>,
     capability_peers: HashMap<String, ServerInfo>,
     addrs: &HashMap<String, Vec<String>>,
+    dial_errors: &BTreeMap<String, String>,
     geo: &GeoIp,
 ) -> Snapshot {
     let mut model_reports = Vec::new();
     let mut all_peers: BTreeSet<String> = BTreeSet::new();
     let mut blocks_covered = 0usize;
-    let mut issues = Vec::new();
+    // Keyed by peer so a server carrying several models is reported once.
+    let mut issues: BTreeMap<String, String> = BTreeMap::new();
 
     // Every connected peer's own location, keyed by peer id, so a peer
     // relayed through another *node* can borrow its relay's pin.
@@ -551,13 +571,15 @@ fn build_snapshot(
         let mut server_rows = Vec::new();
         for (peer_id, entry) in peers {
             all_peers.insert(peer_id.clone());
+            // v1 probes only the servers claiming to serve, and reports the
+            // ones that would not answer. A peer that never claimed to serve
+            // is not an issue, and a state that is merely not ONLINE is not a
+            // reachability fact at all — it was the announcement all along.
             if entry.info.state == "online" {
                 covered.extend(entry.blocks.iter().copied());
-            } else {
-                issues.push(ReachabilityIssue {
-                    peer_id: peer_id.clone(),
-                    err: format!("server state is {}", entry.info.state),
-                });
+                if let Some(err) = dial_errors.get(peer_id) {
+                    issues.insert(peer_id.clone(), err.clone());
+                }
             }
 
             let peer_addrs = addrs.get(peer_id).cloned().unwrap_or_default();
@@ -621,7 +643,10 @@ fn build_snapshot(
         num_peers: all_peers.len(),
         num_blocks_covered: blocks_covered,
         model_reports,
-        reachability_issues: issues,
+        reachability_issues: issues
+            .into_iter()
+            .map(|(peer_id, err)| ReachabilityIssue { peer_id, err })
+            .collect(),
         last_updated: Utc::now(),
     }
 }
@@ -798,6 +823,7 @@ mod tests {
             BTreeMap::from([("M".to_string(), peers)]),
             HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &GeoIp::from_env(),
         );
 
@@ -849,6 +875,7 @@ mod tests {
             BTreeMap::from([("M".to_string(), peers)]),
             HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &GeoIp::from_env(),
         );
 
@@ -863,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn an_offline_server_covers_nothing_and_is_reported() {
+    fn an_offline_server_covers_nothing_and_is_not_a_reachability_issue() {
         let model = Model {
             dht_prefix: "M".into(),
             repository: String::new(),
@@ -888,11 +915,68 @@ mod tests {
             BTreeMap::from([("M".to_string(), peers)]),
             HashMap::new(),
             &HashMap::new(),
+            &BTreeMap::new(),
             &GeoIp::from_env(),
         );
 
         assert_eq!(snapshot.num_blocks_covered, 0);
         assert_eq!(snapshot.model_reports[0].state, "broken");
+        // A departed server is an announcement, not a failed dial. v1 probes
+        // only the servers claiming to serve and reports what would not answer.
+        assert!(snapshot.reachability_issues.is_empty());
+    }
+
+    /// A server claiming ONLINE that the crawl could not dial is the one thing
+    /// `reachability_issues` is for, and it is reported once however many
+    /// models it serves.
+    #[test]
+    fn an_undialable_online_server_is_reported_once() {
+        let models = [
+            Model {
+                dht_prefix: "M".into(),
+                repository: String::new(),
+                num_blocks: 1,
+            },
+            Model {
+                dht_prefix: "N".into(),
+                repository: String::new(),
+                num_blocks: 1,
+            },
+        ];
+        let entry = || {
+            let mut peers = HashMap::new();
+            peers.insert(
+                "QmDark".to_string(),
+                PeerModelEntry {
+                    blocks: [0].into_iter().collect(),
+                    info: ServerInfo {
+                        state: "online".into(),
+                        start_block: 0,
+                        end_block: 1,
+                        ..Default::default()
+                    },
+                },
+            );
+            peers
+        };
+        let snapshot = build_snapshot(
+            vec!["online".into()],
+            &models,
+            BTreeMap::from([("M".to_string(), entry()), ("N".to_string(), entry())]),
+            HashMap::new(),
+            &HashMap::new(),
+            &BTreeMap::from([("QmDark".to_string(), "dial timed out after 15s".to_string())]),
+            &GeoIp::from_env(),
+        );
+
         assert_eq!(snapshot.reachability_issues.len(), 1);
+        assert_eq!(snapshot.reachability_issues[0].peer_id, "QmDark");
+        assert_eq!(
+            snapshot.reachability_issues[0].err,
+            "dial timed out after 15s"
+        );
+        // The row still says what the node announced; only the issue list is
+        // about connectivity.
+        assert_eq!(snapshot.model_reports[0].server_rows[0].state, "online");
     }
 }
