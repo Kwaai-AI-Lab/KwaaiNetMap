@@ -53,12 +53,21 @@ impl NodeCache {
         }
     }
 
-    /// Install a fresh crawl. The flat node list is derived once here rather
-    /// than per request, so `/api/nodes` is a clone of an `Arc`.
-    pub fn replace(&self, snapshot: Snapshot) {
-        let derived = crate::crawler::node_entries(&snapshot);
-        *self.snapshot.write().expect("snapshot lock") = Arc::new(snapshot);
+    /// Install a fresh crawl, or hold the served one if this crawl read nothing
+    /// — see [`crate::crawler::merge_crawl`]. Returns what is now served, so
+    /// the caller can log which happened (`crawls_held > 0` means it held).
+    ///
+    /// The read-then-write is not atomic, which is safe because the crawler is
+    /// the only writer.
+    pub fn publish(&self, snapshot: Snapshot) -> Arc<Snapshot> {
+        let served = Arc::new(crate::crawler::merge_crawl(&self.snapshot(), snapshot));
+        // The flat node list is derived once here rather than per request, so
+        // `/api/nodes` is a clone of an `Arc` — and a held snapshot keeps the
+        // entries consistent with the peer data it is still serving.
+        let derived = crate::crawler::node_entries(&served);
+        *self.snapshot.write().expect("snapshot lock") = Arc::clone(&served);
         *self.nodes.write().expect("nodes lock") = Arc::new(derived);
+        served
     }
 
     pub fn snapshot(&self) -> Arc<Snapshot> {
