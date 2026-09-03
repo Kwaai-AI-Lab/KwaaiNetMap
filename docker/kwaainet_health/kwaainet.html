@@ -904,9 +904,19 @@
         // state when its own probe of an ONLINE server fails. Departed is v2-only
         // for the same kind of reason — hivemind drops a record carrying the -1
         // tombstone rather than decoding it, so v1 never sees one.
-        const STATUS_LABELS = { online: 'Sharding', joining: 'Ready', offline: 'Departed', unreachable: 'Unreachable' };
+        const STATUS_LABELS = { online: 'Sharding', joining: 'Idle', offline: 'Departed', unreachable: 'Unreachable' };
         const statusLabel = (state) => STATUS_LABELS[state] || 'Unknown';
         const statusClass = (state) => `status-${STATUS_LABELS[state] ? state : 'unknown'}`;
+
+        // JOINING is two situations. A node only claims Loading while a shard is
+        // actually loading; everything else that is up but not serving reads
+        // Idle, which promises nothing — including nodes too old to say.
+        const serverStatus = (server) => {
+            const info = (server.span && server.span.server_info) || {};
+            return server.state === 'joining' && info.shard_loading
+                ? 'Loading'
+                : statusLabel(server.state);
+        };
 
         // Map View Logic
         function updateMapView(data) {
@@ -955,7 +965,7 @@
                     let marker = L.marker([lat, lon], { icon: markerIcon });
                     let popupContent = `
                         <b>Model:</b> ${report.name}<br>
-                        <b>Status:</b> <span class="${statusClass(server.state)}">${statusLabel(server.state)}</span><br>
+                        <b>Status:</b> <span class="${statusClass(server.state)}">${serverStatus(server)}</span><br>
                         <b>Location:</b> ${locationInfo}<br>
                         <b>Public Name:</b> ${publicName}<br>
                         <b>Blocks:</b> ${blocks}<br>
@@ -1371,12 +1381,12 @@
                         id: serverId,
                         label: nodeLabel,
                         group: modelName,
-                        status: statusLabel(server.state),
+                        status: serverStatus(server),
                         location: locationInfo,
                         throughput: throughput ? throughput.toFixed(2) : "N/A",
                         connectionType: connectionType,
                         blocks: blocks,
-                        title: `Model: ${modelName}<br>Status: ${statusLabel(server.state)}<br>Location: ${locationInfo}<br>Blocks: ${blocks}`,
+                        title: `Model: ${modelName}<br>Status: ${serverStatus(server)}<br>Location: ${locationInfo}<br>Blocks: ${blocks}`,
                         borderWidth: 2,
                         level: 2,
                         // Different shape based on connection type
@@ -1540,7 +1550,7 @@
                         // The label is the row's value so the Status column
                         // sorts and the search box matches on what is displayed;
                         // the wire value rides along for the colour class.
-                        state: statusLabel(server.state),
+                        state: serverStatus(server),
                         stateKey: server.state,
                         connectionType: connectionType
                     });

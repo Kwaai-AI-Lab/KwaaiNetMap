@@ -106,6 +106,7 @@ pub fn decode_server_info(bytes: &[u8]) -> Option<ServerInfo> {
             "torch_dtype" => info.torch_dtype = s(v),
             "quant_type" => info.quant_type = s(v),
             "using_relay" => info.using_relay = v.as_bool(),
+            "shard_loading" => info.shard_loading = v.as_bool(),
             "cache_tokens_left" => info.cache_tokens_left = v.as_i64(),
             "peer_id" => info.peer_id = s(v),
             "vpk" => info.vpk = serde_json::to_value(v).ok(),
@@ -190,6 +191,29 @@ mod tests {
         assert_eq!(info.end_block, 15);
         assert_eq!(info.public_name.as_deref(), Some("alice"));
         assert_eq!(info.using_relay, Some(true));
+    }
+
+    #[test]
+    fn shard_loading_is_read_when_present_and_absent_is_not_false_positive() {
+        let with = ext(
+            64,
+            Value::Array(vec![
+                Value::from(1),
+                Value::from(0.0),
+                Value::Map(vec![(Value::from("shard_loading"), Value::from(true))]),
+            ]),
+        );
+        assert_eq!(decode_server_info(&with).unwrap().shard_loading, Some(true));
+
+        let without = ext(
+            64,
+            Value::Array(vec![
+                Value::from(1),
+                Value::from(0.0),
+                Value::Map(vec![(Value::from("start_block"), Value::from(0))]),
+            ]),
+        );
+        assert_eq!(decode_server_info(&without).unwrap().shard_loading, None);
     }
 
     #[test]

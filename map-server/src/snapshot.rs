@@ -38,6 +38,11 @@ pub struct ServerInfo {
     pub using_relay: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_tokens_left: Option<i64>,
+    /// A block shard is loading. Only sent while `state` is `joining`, and only
+    /// by a node new enough to say so — absent means "not known to be loading",
+    /// which the page words as idle rather than as progress.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shard_loading: Option<bool>,
     /// VPK capability map, when the node published one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vpk: Option<serde_json::Value>,
