@@ -12,11 +12,12 @@ script and is what the Dockerfile and CI call.
 `libp2p-kad 0.48.0` (from rust-libp2p, MIT) with one API restoration, applied
 via `[patch.crates-io]` in `map-server/Cargo.toml`: the public
 `set_protocol_names` setter upstream removed in its `Config::default()`
-deprecation sweep. kwaai-p2p (≥ 0.6.5) uses it to negotiate
-`/kwaai/kad/1.0.0` alongside the legacy `/ipfs/kad/1.0.0` — the migration
-that keeps publicly reachable KwaaiNet nodes out of the global IPFS DHT's
-routing tables — so this crate does not compile against those versions
-without the patch. Same patch, same reason to repeat it here as
+deprecation sweep. kwaai-p2p uses it to negotiate `/kwaai/kad/1.0.0` alongside
+the legacy `/ipfs/kad/1.0.0` — the migration that keeps publicly reachable
+KwaaiNet nodes out of the global IPFS DHT's routing tables. Since 0.6.8 that
+call is behind kwaai-p2p's `kad-multi-protocol` feature, which `Cargo.toml`
+enables so the map can still see a pre-migration node; the patch is what makes
+that feature compile. Same patch, same reason to repeat it here as
 multistream-select below: `[patch.crates-io]` applies only to a build's root
 manifest. Copy of KwaaiNet's `core/patches/libp2p-kad.patch`; the two must
 not diverge.

@@ -14,9 +14,15 @@
 //! An observer must read the DHT and publish nothing, or the map counts itself
 //! as a serving node and claims blocks it does not have. Here that is
 //! structural rather than configured: announcing is an explicit call this
-//! crate never makes, and `dht_server: false` keeps Kademlia a client that
-//! answers no one else's queries. There is no `announce_self` flag to be
-//! silently ignored by the wrong binary version.
+//! crate never makes. There is no `announce_self` flag to be silently ignored
+//! by the wrong binary version.
+//!
+//! `dht_server: false` does *not* force kad into client mode — it leaves
+//! auto-mode, which flips to Server if reachability ever confirms an external
+//! address. That matters because this build serves the legacy
+//! `/ipfs/kad/1.0.0`: an inbound-reachable libp2p port would make the map
+//! absorbable by the public IPFS DHT. It listens on an ephemeral port that
+//! nothing publishes, so autonat's verdict stays Private.
 
 use anyhow::{Context, Result};
 use kwaai_p2p::{Multiaddr, NetworkConfig, NetworkHandle, NetworkService};

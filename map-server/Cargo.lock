@@ -1528,9 +1528,9 @@ dependencies = [
 
 [[package]]
 name = "kwaai-hivemind-dht"
-version = "0.6.3"
+version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be1d10414cc163b13b2a546eface20d1935dc1f4e5a6c676c2c8219757c66453"
+checksum = "4ea48b70e227982e0819787be52dd0d9c818415302183b4e4fb1f54fb3508262"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1551,9 +1551,9 @@ dependencies = [
 
 [[package]]
 name = "kwaai-p2p"
-version = "0.6.3"
+version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32c5e43c0442c89bb8cbf5520657695b6af009c0d876d0eb07d1fb581263fe30"
+checksum = "e40d07cd58b5be4d1f4cdd1cdfb1194fe6b4af001ea9912e52f4bba50163b93f"
 dependencies = [
  "anyhow",
  "async-trait",
