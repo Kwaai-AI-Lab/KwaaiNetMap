@@ -6,4 +6,3 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 bash "$DIR/fetch-multistream-select.sh"
-bash "$DIR/fetch-libp2p-kad.sh"

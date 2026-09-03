@@ -2,14 +2,11 @@
 # libp2p protocol IDs. Upstream multistream-select rejects any name without a
 # leading `/`, so without this every rpc_find fails dialer-side with
 # "A protocol (name) is invalid" — and an empty crawl is indistinguishable from
-# an empty network, so the map would serve a plausible lie. libp2p-kad restores
-# the multi-protocol-names setter that kwaai-p2p's `kad-multi-protocol` feature
-# needs (see the dependency below). Run `bash patches/fetch-patches.sh` before
-# the first build; cargo cannot parse this manifest until the patched sources
-# exist.
+# an empty network, so the map would serve a plausible lie. Run
+# `bash patches/fetch-patches.sh` before the first build; cargo cannot parse
+# this manifest until the patched source exists.
 [patch.crates-io]
 multistream-select = { path = "patches/multistream-select" }
-libp2p-kad = { path = "patches/libp2p-kad" }
 
 [package]
 name = "map-server"
@@ -31,19 +28,9 @@ path = "src/main.rs"
 # `kwaai-p2p-daemon` — that crate wraps the standalone Go libp2p daemon, which
 # KwaaiNet has replaced, and its build script needs a Go toolchain to compile
 # the Go binary. Nothing here speaks the p2pd control protocol.
-#
-# `kad-multi-protocol` for the migration window. The crawl's *discovery* is
-# kad-free — it is `rpc_find` against explicit bootstrap multiaddrs — but the
-# location and reachability pass dials each discovered peer by bare `/p2p/<id>`
-# and kwaai-p2p can only source addresses for that from its kad routing table,
-# which libp2p-kad populates only for peers whose protocol set intersects ours
-# (`connection_updated` drops an Absent entry that is not Connected, and a walk
-# tables nothing). Serving `/kwaai/kad/1.0.0` alone would therefore leave every
-# ≤ 0.6.7 node unlocated and falsely listed in `reachability_issues`. Retire
-# this with KwaaiNet's own feature once the fleet has moved.
 [dependencies]
 kwaai-hivemind-dht = "0.6.8"
-kwaai-p2p = { version = "0.6.8", features = ["kad-multi-protocol"] }
+kwaai-p2p = "0.6.8"
 
 # Web framework
 axum = { version = "0.7", features = ["macros", "ws"] }

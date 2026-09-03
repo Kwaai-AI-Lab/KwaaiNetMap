@@ -19,10 +19,10 @@
 //!
 //! `dht_server: false` does *not* force kad into client mode — it leaves
 //! auto-mode, which flips to Server if reachability ever confirms an external
-//! address. That matters because this build serves the legacy
-//! `/ipfs/kad/1.0.0`: an inbound-reachable libp2p port would make the map
-//! absorbable by the public IPFS DHT. It listens on an ephemeral port that
-//! nothing publishes, so autonat's verdict stays Private.
+//! address. So kad may yet answer queries; what it cannot do is announce, and
+//! the names it serves are `/kwaai/kad/1.0.0` alone (kwaai-p2p's
+//! `kad-multi-protocol` feature is not taken), so nothing here can be drawn
+//! into the public IPFS DHT.
 
 use anyhow::{Context, Result};
 use kwaai_p2p::{Multiaddr, NetworkConfig, NetworkHandle, NetworkService};

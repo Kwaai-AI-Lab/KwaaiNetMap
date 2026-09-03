@@ -9,4 +9,3 @@ apps/map/dist/
 # Expanded by the map-server/patches/fetch-*.sh scripts; only the patch
 # file and the fetch script are committed.
 map-server/patches/multistream-select/
-map-server/patches/libp2p-kad/

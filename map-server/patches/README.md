@@ -7,20 +7,12 @@ crates are produced locally and gitignored.
 `fetch-patches.sh` is the single entry point — it runs every per-crate fetch
 script and is what the Dockerfile and CI call.
 
-## libp2p-kad (multi-protocol names)
-
-`libp2p-kad 0.48.0` (from rust-libp2p, MIT) with one API restoration, applied
-via `[patch.crates-io]` in `map-server/Cargo.toml`: the public
-`set_protocol_names` setter upstream removed in its `Config::default()`
-deprecation sweep. kwaai-p2p uses it to negotiate `/kwaai/kad/1.0.0` alongside
-the legacy `/ipfs/kad/1.0.0` — the migration that keeps publicly reachable
-KwaaiNet nodes out of the global IPFS DHT's routing tables. Since 0.6.8 that
-call is behind kwaai-p2p's `kad-multi-protocol` feature, which `Cargo.toml`
-enables so the map can still see a pre-migration node; the patch is what makes
-that feature compile. Same patch, same reason to repeat it here as
-multistream-select below: `[patch.crates-io]` applies only to a build's root
-manifest. Copy of KwaaiNet's `core/patches/libp2p-kad.patch`; the two must
-not diverge.
+A libp2p-kad patch used to live here too, restoring the `set_protocol_names`
+setter kwaai-p2p needed to serve `/kwaai/kad/1.0.0` alongside the legacy
+`/ipfs/kad/1.0.0`. Since kwaai-p2p 0.6.8 that call sits behind the crate's
+`kad-multi-protocol` feature, which the map does not take: it ships after
+0.6.8 has propagated, so there is no pre-migration node left to reach over the
+old name. Nothing here needs the setter, and the patch is gone.
 
 ## multistream-select (slash-less protocol IDs)
 
@@ -44,13 +36,13 @@ crate is built standalone rather than inside that workspace.
 
 ### Fresh checkout
 
-Cargo cannot parse the manifest until the patched sources exist:
+Cargo cannot parse the manifest until the patched source exists:
 
 ```sh
 bash map-server/patches/fetch-patches.sh
 ```
 
-`Dockerfile.map-server` and the CI workflow run it automatically. Each script
+`Dockerfile.map-server` and the CI workflow run it automatically. The script
 pins its crates.io tarball by sha256 and is a no-op once the source is present
 and matches the patch.
 
