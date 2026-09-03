@@ -190,6 +190,18 @@ pub struct Snapshot {
     /// both; a dashboard reading them should not lose them at the cutover.
     pub update_period: u64,
     pub update_duration: f64,
+    /// When the peer data above was last actually read, if the crawls since
+    /// then read nothing and this document is being held. `None` while fresh.
+    ///
+    /// Both fields are skipped when they carry their fresh value, so a normal
+    /// pass serializes byte-for-byte the document v1 serves and `make
+    /// map-compare` stays a real test; they appear on the wire only while a
+    /// snapshot is held. `serde(default)` is the reading half of that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_since: Option<DateTime<Utc>>,
+    /// How many consecutive empty crawls have been held off.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub crawls_held: u32,
 }
 
 impl Default for Snapshot {
@@ -204,8 +216,14 @@ impl Default for Snapshot {
             last_updated: Utc::now(),
             update_period: 0,
             update_duration: 0.0,
+            stale_since: None,
+            crawls_held: 0,
         }
     }
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// `...` plus the last six characters, matching v1's table column.

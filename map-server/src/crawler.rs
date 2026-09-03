@@ -72,18 +72,25 @@ pub async fn run_crawler(
     loop {
         match crawl_once(&handle, &bootstrap_peers, &geo).await {
             Ok(Some(snapshot)) => {
-                info!(
-                    "crawl complete: {} peer(s), {} model(s), {}/{} bootstrap online",
-                    snapshot.num_peers,
-                    snapshot.model_reports.len(),
-                    snapshot
-                        .bootstrap_states
-                        .iter()
-                        .filter(|s| *s == "online")
-                        .count(),
-                    snapshot.bootstrap_states.len(),
-                );
-                cache.replace(snapshot);
+                let served = cache.publish(snapshot);
+                if served.crawls_held > 0 {
+                    // The bootstrap count is the one thing a held pass did
+                    // measure, so it belongs on this line too.
+                    warn!(
+                        "crawl read 0 peers ({} bootstrap online) — holding the snapshot of {} peer(s) from {} (held {}x)",
+                        bootstrap_tally(&served),
+                        served.num_peers,
+                        served.last_updated,
+                        served.crawls_held,
+                    );
+                } else {
+                    info!(
+                        "crawl complete: {} peer(s), {} model(s), {} bootstrap online",
+                        served.num_peers,
+                        served.model_reports.len(),
+                        bootstrap_tally(&served),
+                    );
+                }
             }
             // Reserved for a transport failure with nothing to publish.
             Ok(None) => {}
@@ -91,6 +98,16 @@ pub async fn run_crawler(
         }
         tokio::time::sleep(CRAWL_INTERVAL).await;
     }
+}
+
+/// `online/total` over the bootstrap dots, as both crawl log lines report it.
+fn bootstrap_tally(snapshot: &Snapshot) -> String {
+    let online = snapshot
+        .bootstrap_states
+        .iter()
+        .filter(|s| *s == "online")
+        .count();
+    format!("{online}/{}", snapshot.bootstrap_states.len())
 }
 
 /// One full pass. `Ok(None)` is unreachable now that the swarm is in-process;
@@ -279,13 +296,39 @@ async fn rpc_find_inner(
     let mut bytes = Vec::new();
     request.encode(&mut bytes).ok()?;
 
-    match handle.call_unary_handler(bp, PROTOCOL_FIND, &bytes).await {
-        Ok(resp) => FindResponse::decode(&resp[..]).ok(),
-        Err(e) => {
-            warn!("rpc_find failed against {bootstrap}: {e}");
-            None
-        }
-    }
+    let e = match handle.call_unary_handler(bp, PROTOCOL_FIND, &bytes).await {
+        Ok(resp) => return FindResponse::decode(&resp[..]).ok(),
+        Err(e) => e,
+    };
+    warn!("rpc_find failed against {bootstrap}: {e}");
+
+    // Measured on production: 48 of 234 crawls lost an rpc_find to
+    // `P2PError::Abandoned` — the connection carrying it closed, which the
+    // bootstraps do after ~30s idle. One such loss drops the bootstrap for the
+    // whole pass and paints it offline, so it is worth one retry.
+    //
+    // The redial is not reliably a redial: `Command::ConnectPeer` answers Ok
+    // from the swarm's own connection record (`DialPeerConditionFalse` maps to
+    // `AlreadyConnected`, which `ConnectPeer` reports as success), so if the
+    // swarm has not yet seen the close it dials nothing. Hence the log line —
+    // redial=ok with rpc=err is the shape that says exactly that.
+    let redial =
+        match tokio::time::timeout(BOOTSTRAP_DIAL_TIMEOUT, handle.connect_peer(bootstrap)).await {
+            Ok(Ok(_)) => "ok".to_string(),
+            Ok(Err(e)) => format!("err({e})"),
+            Err(_) => "timeout".to_string(),
+        };
+    let retried = handle.call_unary_handler(bp, PROTOCOL_FIND, &bytes).await;
+    let rpc = match &retried {
+        Ok(_) => "ok".to_string(),
+        Err(e) => format!("err({e})"),
+    };
+    info!("rpc_find retry against {bootstrap}: redial={redial} rpc={rpc}");
+
+    // Only this outcome reaches `set.record`; the first failure is not recorded.
+    retried
+        .ok()
+        .and_then(|resp| FindResponse::decode(&resp[..]).ok())
 }
 
 struct Model {
@@ -648,6 +691,10 @@ fn build_snapshot(
             .map(|(peer_id, err)| ReachabilityIssue { peer_id, err })
             .collect(),
         last_updated: Utc::now(),
+        // A crawl that produced a snapshot is fresh by construction; the hold
+        // logic sets these if it ends up being held instead.
+        stale_since: None,
+        crawls_held: 0,
     }
 }
 
@@ -688,6 +735,31 @@ fn top_contributors(reports: &[ModelReport]) -> Vec<Contributor> {
     out.sort_by(|a, b| b.throughput.total_cmp(&a.throughput));
     out.truncate(5);
     out
+}
+
+/// What to serve, given a fresh crawl and what is currently served.
+///
+/// A pass that read zero peers is far more often both bootstraps having lost
+/// their connection mid-crawl than the network having emptied — measured: 4 of
+/// 234 crawls blanked the public map for a minute with nothing having changed.
+/// So an empty crawl over populated data holds the data and takes only the
+/// bootstrap dots and timings from this pass. Deliberately no partial rule: a
+/// crawl that read *some* peers is real churn and replaces wholesale.
+pub fn merge_crawl(served: &Snapshot, fresh: Snapshot) -> Snapshot {
+    // `served.num_peers == 0` is the startup case — nothing to hold.
+    if fresh.num_peers > 0 || served.num_peers == 0 {
+        return fresh;
+    }
+    Snapshot {
+        bootstrap_states: fresh.bootstrap_states,
+        update_period: fresh.update_period,
+        update_duration: fresh.update_duration,
+        // When the held data was read, so it survives further held passes.
+        stale_since: served.stale_since.or(Some(served.last_updated)),
+        crawls_held: served.crawls_held + 1,
+        // `last_updated` means "when this was read" and must not advance.
+        ..served.clone()
+    }
 }
 
 /// The flat per-peer view `/api/nodes` and `/api/stats` are built from.
@@ -978,5 +1050,88 @@ mod tests {
         // The row still says what the node announced; only the issue list is
         // about connectivity.
         assert_eq!(snapshot.model_reports[0].server_rows[0].state, "online");
+    }
+
+    fn snapshot_of(num_peers: usize, bootstrap_states: &[&str]) -> Snapshot {
+        Snapshot {
+            num_peers,
+            num_blocks_covered: num_peers * 4,
+            bootstrap_states: bootstrap_states.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The measured failure: both bootstraps lost their connection mid-crawl,
+    /// the pass read nothing, and the map went blank for a minute.
+    #[test]
+    fn an_empty_crawl_holds_the_served_peer_data() {
+        let mut served = snapshot_of(7, &["online", "online"]);
+        served.last_updated = Utc::now() - chrono::Duration::seconds(60);
+        let read_at = served.last_updated;
+
+        let merged = merge_crawl(&served, snapshot_of(0, &["offline", "offline"]));
+
+        assert_eq!(merged.num_peers, 7);
+        assert_eq!(merged.num_blocks_covered, 28);
+        // "when this data was read" — it must not advance while held.
+        assert_eq!(merged.last_updated, read_at);
+        // The dots are about this pass, not the held data.
+        assert_eq!(merged.bootstrap_states, vec!["offline", "offline"]);
+        assert_eq!(merged.stale_since, Some(read_at));
+        assert_eq!(merged.crawls_held, 1);
+    }
+
+    #[test]
+    fn a_second_held_pass_keeps_the_original_stale_since() {
+        let mut served = snapshot_of(7, &["offline", "offline"]);
+        served.last_updated = Utc::now() - chrono::Duration::seconds(120);
+        let first_stale = Utc::now() - chrono::Duration::seconds(180);
+        served.stale_since = Some(first_stale);
+        served.crawls_held = 1;
+
+        let merged = merge_crawl(&served, snapshot_of(0, &["offline", "online"]));
+
+        assert_eq!(merged.stale_since, Some(first_stale));
+        assert_eq!(merged.crawls_held, 2);
+    }
+
+    #[test]
+    fn a_crawl_that_read_peers_replaces_and_clears_the_stale_marks() {
+        let mut served = snapshot_of(7, &["offline", "offline"]);
+        served.stale_since = Some(Utc::now());
+        served.crawls_held = 3;
+
+        let merged = merge_crawl(&served, snapshot_of(2, &["online", "online"]));
+
+        // Real churn, even downward: 2 peers replaces 7.
+        assert_eq!(merged.num_peers, 2);
+        assert_eq!(merged.stale_since, None);
+        assert_eq!(merged.crawls_held, 0);
+    }
+
+    /// The hold fields must not widen the v1 document: `make map-compare`
+    /// diffs this JSON against v1's on every pass, and a `"stale_since": null`
+    /// on every fresh snapshot would make it disagree forever.
+    #[test]
+    fn the_hold_fields_reach_the_wire_only_while_held() {
+        let fresh = serde_json::to_value(snapshot_of(7, &["online"])).unwrap();
+        assert!(fresh.get("stale_since").is_none());
+        assert!(fresh.get("crawls_held").is_none());
+
+        let held = merge_crawl(&snapshot_of(7, &["online"]), snapshot_of(0, &["offline"]));
+        let held = serde_json::to_value(held).unwrap();
+        assert!(held.get("stale_since").is_some());
+        assert_eq!(held.get("crawls_held").and_then(|v| v.as_u64()), Some(1));
+    }
+
+    /// Startup: the cache holds `Snapshot::default()`, so there is nothing to
+    /// hold and an empty first crawl must be published as-is.
+    #[test]
+    fn an_empty_crawl_over_an_empty_cache_replaces() {
+        let merged = merge_crawl(&Snapshot::default(), snapshot_of(0, &["offline"]));
+
+        assert_eq!(merged.bootstrap_states, vec!["offline"]);
+        assert_eq!(merged.crawls_held, 0);
+        assert_eq!(merged.stale_since, None);
     }
 }
