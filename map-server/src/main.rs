@@ -50,6 +50,13 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok());
 
+    // Off only for a network built on IANA-reserved address space, which the
+    // swarm's default policy rejects; see kwaai-p2p's `only_global_ips`.
+    let only_global_ips = !matches!(
+        std::env::var("MAP_ONLY_GLOBAL_IPS").as_deref(),
+        Ok("0") | Ok("false") | Ok("no")
+    );
+
     // Bootstrap peers from env (space-separated multiaddrs) or use defaults.
     let bootstrap_peers: Vec<String> = std::env::var("BOOTSTRAP_PEERS")
         .unwrap_or_default()
@@ -68,7 +75,7 @@ async fn main() -> Result<()> {
 
     // This process's own rust-libp2p swarm. Both the crawler and the
     // reachability probes drive it; there is no separate node process.
-    let observer = observer::start(&bootstrap_peers).await?;
+    let observer = observer::start(&bootstrap_peers, only_global_ips).await?;
     let handle = observer.handle.clone();
 
     let node_cache = Arc::new(cache::NodeCache::new());
