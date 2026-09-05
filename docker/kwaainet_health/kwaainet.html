@@ -515,6 +515,16 @@
             font-weight: bold;
         }
 
+        /* Role column (VPK) */
+        .role-set {
+            color: #2e6fb4;
+            font-weight: bold;
+        }
+
+        .role-none {
+            color: #aaa;
+        }
+
         /* Throughput colors */
         .throughput-high {
             color: green;
@@ -595,14 +605,14 @@
                 <table id="model-table" class="data-table">
                     <thead>
                         <tr>
-                            <th data-sort="state">Status <span class="sort-indicator"></span></th>
-                            <th data-sort="location">Location <span class="sort-indicator"></span></th>
                             <th data-sort="publicName">Public Name <span class="sort-indicator"></span></th>
-                            <th data-sort="version">Version <span class="sort-indicator"></span></th>
+                            <th data-sort="location">Location <span class="sort-indicator"></span></th>
                             <th data-sort="peerId">Peer ID <span class="sort-indicator"></span></th>
-                            <th data-sort="blocks">Blocks <span class="sort-indicator"></span></th>
-                            <th data-sort="connectionType">Connection Type <span class="sort-indicator"></span></th>
-                            <th data-sort="throughput">Throughput (tok/sec) <span class="sort-indicator"></span></th>
+                            <th data-sort="version">Version <span class="sort-indicator"></span></th>
+                            <th data-sort="connectionType">Connection <span class="sort-indicator"></span></th>
+                            <th data-sort="state">Sharding <span class="sort-indicator"></span></th>
+                            <th data-sort="vpk">VPK <span class="sort-indicator"></span></th>
+                            <th data-sort="throughput">Tok/sec <span class="sort-indicator"></span></th>
                         </tr>
                     </thead>
                     <tbody>
@@ -795,7 +805,7 @@
                 if (params.nodes.length > 0) {
                     var nodeId = params.nodes[0];
                     var node = nodes.get(nodeId);
-                    alert(`Node: ${node.label}\nModel: ${node.group || 'N/A'}\nStatus: ${node.status || 'N/A'}\nLocation: ${node.location || 'N/A'}`);
+                    alert(`Node: ${node.label}\nModel: ${node.group || 'N/A'}\nSharding: ${node.status || 'N/A'}\nLocation: ${node.location || 'N/A'}`);
                 }
             });
             
@@ -1007,12 +1017,31 @@
         // JOINING is two situations. A node only claims Loading while a shard is
         // actually loading; everything else that is up but not serving reads
         // Idle, which promises nothing — including nodes too old to say.
+        // The range rides on the label only where it means something: the
+        // blocks a Serving node answers for, or a Loading node is fetching.
+        // Idle and Departed nodes still announce one, but it promises nothing.
+        const blockRange = (server) => server.span ? `[${server.span.start}:${server.span.end}]` : '';
         const serverStatus = (server) => {
             const info = (server.span && server.span.server_info) || {};
-            return server.state === 'joining' && info.shard_loading
-                ? 'Loading'
-                : statusLabel(server.state);
+            if (server.state === 'online') return `Serving ${blockRange(server)}`;
+            if (server.state === 'joining' && info.shard_loading) return `Loading ${blockRange(server)}`;
+            return statusLabel(server.state);
         };
+
+        // A node announces a role only when the service behind it answers
+        // its local health check, so absence means "not advertising", not
+        // "not running". Bobs never advertise: nothing on a Bob serves a
+        // health endpoint, so a remote peer is told of Eves only.
+        const ROLE_LABELS = { eve: 'Eve', bob: 'Bob', both: 'Eve + Bob' };
+        const roleLabel = (cap) => {
+            if (!cap || typeof cap !== 'object') return '';
+            const mode = String(cap.mode || '').toLowerCase();
+            return ROLE_LABELS[mode] || (mode ? mode : 'Yes');
+        };
+        const vpkRole = (server) => roleLabel(((server.span || {}).server_info || {}).vpk);
+        const roleCell = (label) => label
+            ? `<span class="role-set">${label}</span>`
+            : '<span class="role-none">—</span>';
 
         // Map View Logic
         //
@@ -1197,7 +1226,6 @@
 
         function nodePopupHtml(node) {
             const { server, report } = node;
-            const blocks = server.span ? server.span.start + "-" + server.span.end : "N/A";
             const throughput = server.span && server.span.server_info ? server.span.server_info.throughput : 0;
             let throughputColor = "#FF0000"; // Default to red
             if (throughput > 500) {
@@ -1210,12 +1238,12 @@
             const connectionTypeColor = connectionTypeStyle(connectionType).color;
             return `<div class="site-node">
                 <b>Model:</b> ${report.name}<br>
-                <b>Status:</b> <span class="${statusClass(server.state)}">${serverStatus(server)}</span><br>
+                <b>Sharding:</b> <span class="${statusClass(server.state)}">${serverStatus(server)}</span><br>
+                <b>VPK:</b> ${roleCell(vpkRole(server))}<br>
                 <b>Public Name:</b> ${publicName}<br>
                 <b>Version:</b> ${version}<br>
-                <b>Blocks:</b> ${blocks}<br>
-                <b>Connection Type:</b> <span style="color:${connectionTypeColor}; font-weight:bold;">${connectionType}</span><br>
-                <b>Throughput (tok/sec):</b> <span style="color:${throughputColor}">${throughput ? throughput.toFixed(2) : "N/A"}</span>
+                <b>Connection:</b> <span style="color:${connectionTypeColor}; font-weight:bold;">${connectionType}</span><br>
+                <b>Tok/sec:</b> <span style="color:${throughputColor}">${throughput ? throughput.toFixed(2) : "N/A"}</span>
             </div>`;
         }
 
@@ -1421,7 +1449,7 @@
             if (pageData.length === 0) {
                 const row = document.createElement('tr');
                 const cell = document.createElement('td');
-                cell.colSpan = 8; // Updated column count
+                cell.colSpan = 8;
                 cell.textContent = 'No data found';
                 cell.style.textAlign = 'center';
                 row.appendChild(cell);
@@ -1433,33 +1461,27 @@
                 const row = document.createElement('tr');
                 
                 
-                // Status
-                const stateCell = document.createElement('td');
-                stateCell.innerHTML = `<span class="${statusClass(rowData.stateKey)}">${rowData.state}</span>`;
-                row.appendChild(stateCell);
-                
-                // Location
-                const locationCell = document.createElement('td');
-                locationCell.textContent = rowData.location;
-                row.appendChild(locationCell);
-                
                 // Public Name
                 const publicNameCell = document.createElement('td');
                 publicNameCell.textContent = rowData.publicName;
                 row.appendChild(publicNameCell);
 
-                // Version
-                const versionCell = document.createElement('td');
-                versionCell.textContent = rowData.version;
-                row.appendChild(versionCell);
+                // Location
+                const locationCell = document.createElement('td');
+                locationCell.textContent = rowData.location;
+                row.appendChild(locationCell);
 
                 // Peer ID (abbreviated, full ID in tooltip, with copy button)
                 const peerIdCell = document.createElement('td');
                 peerIdCell.className = 'peer-id-cell';
                 const fullPeerId = rowData.peerId || '';
                 const peerIdText = document.createElement('span');
+                // The leading `12D3KooW` is the multihash header every Ed25519
+                // key shares (`Qm` for RSA), not identity — only the tail tells
+                // peers apart. Two leading characters name the key type; the
+                // full id stays in the tooltip and on copy.
                 if (fullPeerId && fullPeerId.length > 16) {
-                    peerIdText.textContent = fullPeerId.slice(0, 12) + '…' + fullPeerId.slice(-4);
+                    peerIdText.textContent = fullPeerId.slice(0, 2) + '…' + fullPeerId.slice(-8);
                 } else {
                     peerIdText.textContent = fullPeerId || 'N/A';
                 }
@@ -1516,21 +1538,31 @@
                 }
                 row.appendChild(peerIdCell);
 
-                // Blocks
-                const blocksCell = document.createElement('td');
-                blocksCell.textContent = rowData.blocks;
-                row.appendChild(blocksCell);
-                
+                // Version
+                const versionCell = document.createElement('td');
+                versionCell.textContent = rowData.version;
+                row.appendChild(versionCell);
+
                 // Connection Type
                 const connectionTypeCell = document.createElement('td');
                 connectionTypeCell.innerHTML = getConnectionTypeHtml(rowData.connectionType);
                 row.appendChild(connectionTypeCell);
-                
+
+                // Status
+                const stateCell = document.createElement('td');
+                stateCell.innerHTML = `<span class="${statusClass(rowData.stateKey)}">${rowData.state}</span>`;
+                row.appendChild(stateCell);
+
+                // VPK role
+                const vpkCell = document.createElement('td');
+                vpkCell.innerHTML = roleCell(rowData.vpk);
+                row.appendChild(vpkCell);
+
                 // Throughput
                 const throughputCell = document.createElement('td');
                 throughputCell.innerHTML = getThroughputHtml(rowData.throughput);
                 row.appendChild(throughputCell);
-                
+
                 tableBody.appendChild(row);
             });
             
@@ -1728,7 +1760,6 @@
                     }
                     
                     // Get additional server info
-                    const blocks = server.span ? `${server.span.start}-${server.span.end}` : "N/A";
                     const publicName = nameAndVersion(server).name;
                     const connectionType = getConnectionType(server);
                     const throughput = server.span && server.span.server_info ? 
@@ -1746,8 +1777,7 @@
                         location: locationInfo,
                         throughput: throughput ? throughput.toFixed(2) : "N/A",
                         connectionType: connectionType,
-                        blocks: blocks,
-                        title: `Model: ${modelName}<br>Status: ${serverStatus(server)}<br>Location: ${locationInfo}<br>Blocks: ${blocks}`,
+                        title: `Model: ${modelName}<br>Sharding: ${serverStatus(server)}<br>VPK: ${vpkRole(server) || "—"}<br>Location: ${locationInfo}`,
                         borderWidth: 2,
                         level: 2,
                         // Different shape based on connection type
@@ -1895,7 +1925,6 @@
                     const locationInfo = location && location.status === "success" ? 
                         `${location.city}, ${location.country}` : "Location Unknown";
                     
-                    const blocks = server.span ? `${server.span.start}-${server.span.end}` : "N/A";
                     const throughput = server.span && server.span.server_info ? server.span.server_info.throughput : 0;
                     const { name: publicName, version } = nameAndVersion(server);
                     const connectionType = getConnectionType(server);
@@ -1906,13 +1935,13 @@
                         publicName: publicName,
                         version: version,
                         peerId: server.peer_id || "",
-                        blocks: blocks,
                         throughput: throughput ? throughput.toFixed(2) : "N/A",
                         // The label is the row's value so the Status column
                         // sorts and the search box matches on what is displayed;
                         // the wire value rides along for the colour class.
                         state: serverStatus(server),
                         stateKey: server.state,
+                        vpk: vpkRole(server),
                         connectionType: connectionType
                     });
                 });
