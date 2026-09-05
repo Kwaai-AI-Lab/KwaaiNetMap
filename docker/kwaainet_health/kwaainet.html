@@ -470,6 +470,11 @@
             color: purple;
             font-weight: bold;
         }
+
+        .connection-nat {
+            color: teal;
+            font-weight: bold;
+        }
     </style>
 </head>
 <body>
@@ -867,33 +872,42 @@
         }
 
         // Helper function to get connection type
-        // Derived from the peer's advertised multiaddrs so it stays consistent
+        // Derived from the peer's observed multiaddrs so it stays consistent
         // with the Location column (which uses the same multiaddr signal). The
         // node-self-reported `using_relay` field is computed from config-time
-        // intent rather than runtime reachability, so it can lie — a NATed peer
-        // with any `announce_addr` configured will still report `using_relay:
-        // false` even when its only published address is a /p2p-circuit/.
+        // intent rather than runtime reachability, so it can understate NAT — a
+        // NATed peer with any `announce_addr` configured will still report
+        // `using_relay: false` even when its only published address is a
+        // /p2p-circuit/. It cannot overstate it, so a peer that says it needs a
+        // relay yet was reached without one is a NATed peer the observer
+        // hole-punched: reachable to a DCUtR-capable dialer, not to anyone.
         function getConnectionType(server) {
+            const info = server.span && server.span.server_info;
             const addrs = server.peer_ip_info && server.peer_ip_info.multiaddrs;
             if (Array.isArray(addrs) && addrs.length > 0) {
-                return addrs.some(a => typeof a === 'string' && a.includes('/p2p-circuit')) ? "Relay" : "Direct";
+                if (addrs.some(a => typeof a === 'string' && a.includes('/p2p-circuit'))) {
+                    return "Relay";
+                }
+                return info && info.using_relay ? "NAT" : "Direct";
             }
-            if (server.span && server.span.server_info) {
+            if (info) {
                 // Fallback: trust the node's self-report when no multiaddrs are visible.
-                return server.span.server_info.using_relay ? "Relay" : "Direct";
+                return info.using_relay ? "Relay" : "Direct";
             }
             return "Unknown";
         }
+
+        const CONNECTION_TYPE_STYLE = {
+            "Direct":        { cls: "connection-direct", color: "blue",   shape: "dot" },
+            "NAT":           { cls: "connection-nat",    color: "teal",   shape: "triangle" },
+            "Relay":         { cls: "connection-relay",  color: "purple", shape: "diamond" },
+        };
+        const connectionTypeStyle = (type) => CONNECTION_TYPE_STYLE[type] || { cls: "", color: "black", shape: "diamond" };
         
         // Helper function to get connection type HTML
         function getConnectionTypeHtml(type) {
-            if (type === "Direct") {
-                return `<span class="connection-direct">${type}</span>`;
-            } else if (type === "Relay") {
-                return `<span class="connection-relay">${type}</span>`;
-            } else {
-                return type;
-            }
+            const { cls } = connectionTypeStyle(type);
+            return cls ? `<span class="${cls}">${type}</span>` : type;
         }
 
         // Wire states are Petals' ServerState, which is about readiness to serve
@@ -960,7 +974,7 @@
                     
                     // Get connection type
                     const connectionType = getConnectionType(server);
-                    const connectionTypeColor = connectionType === "Direct" ? "blue" : connectionType === "Relay" ? "purple" : "black";
+                    const connectionTypeColor = connectionTypeStyle(connectionType).color;
 
                     let marker = L.marker([lat, lon], { icon: markerIcon });
                     let popupContent = `
@@ -1390,7 +1404,7 @@
                         borderWidth: 2,
                         level: 2,
                         // Different shape based on connection type
-                        shape: connectionType === "Direct" ? "dot" : "diamond",
+                        shape: connectionTypeStyle(connectionType).shape,
                         // Different color shade based on status
                         color: {
                             background: server.state === 'online' ? modelColors[modelName] : '#d3d3d3',

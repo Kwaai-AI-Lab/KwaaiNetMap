@@ -48,6 +48,9 @@ multiaddrs; the image ships with the public KwaaiNet bootstraps as a default.
 Note the build clones upstream and installs Petals from source, so it is slow and the resulting
 image is large.
 
+The Rust `map-server` is configured by environment instead; its variables, including the
+`GEOIP_STATIC_FILE` format for networks geoip cannot place, are in [V2.md](V2.md#running-it).
+
 ## Endpoints
 
 | Route | Returns |

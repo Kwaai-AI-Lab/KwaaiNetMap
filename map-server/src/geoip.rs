@@ -6,12 +6,13 @@
 //! the batch endpoint so one crawl costs one request rather than one per node,
 //! which is what keeps a growing network inside the free tier's 45 req/min.
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
 use dashmap::DashMap;
 use serde::Deserialize;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::snapshot::Location;
 
@@ -48,18 +49,46 @@ pub struct GeoIp {
     client: reqwest::Client,
     endpoint: String,
     enabled: bool,
+    /// Operator-supplied locations keyed by IP, consulted before any lookup
+    /// and regardless of `enabled`. This is how a network on unroutable
+    /// address space (a sealed test bed) gets pins the provider cannot give.
+    statics: HashMap<String, Location>,
+}
+
+/// One `GEOIP_STATIC_FILE` entry: a `Location` without `status`, which is always
+/// "success" — an operator would not list a place they could not name.
+#[derive(Debug, Deserialize)]
+struct StaticEntry {
+    #[serde(default)]
+    country: String,
+    #[serde(default)]
+    city: String,
+    #[serde(default)]
+    lat: f64,
+    #[serde(default)]
+    lon: f64,
+    #[serde(default)]
+    isp: String,
 }
 
 impl GeoIp {
     /// `GEOIP_ENABLED=0` turns lookups off entirely — every node then reports
     /// an unknown location. Sealed or air-gapped deployments want this; so does
     /// anyone unwilling to send operator IPs to a third party.
+    ///
+    /// `GEOIP_STATIC_FILE=<path>` names a JSON file of `{ "<ip>": { country, city,
+    /// lat, lon, isp } }`. Those IPs are pinned as written, lookups on or off,
+    /// public or reserved.
     pub fn from_env() -> Self {
         let enabled = std::env::var("GEOIP_ENABLED")
             .map(|v| !matches!(v.as_str(), "0" | "false" | "no"))
             .unwrap_or(true);
         let endpoint = std::env::var("GEOIP_BATCH_URL")
             .unwrap_or_else(|_| "http://ip-api.com/batch".to_string());
+        let statics = std::env::var("GEOIP_STATIC_FILE")
+            .ok()
+            .map(|path| load_static(&path))
+            .unwrap_or_default();
 
         Self {
             cache: Arc::new(DashMap::new()),
@@ -70,6 +99,15 @@ impl GeoIp {
                 .expect("reqwest client"),
             endpoint,
             enabled,
+            statics,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_statics(statics: HashMap<String, Location>) -> Self {
+        Self {
+            statics,
+            ..Self::from_env()
         }
     }
 
@@ -144,6 +182,9 @@ impl GeoIp {
     /// instead of at the (0,0) sentinel, while the "Via relay" label keeps
     /// the popup honest about whose city that is.
     pub fn locate(&self, addrs: &[String]) -> Location {
+        if let Some(loc) = self.static_for(addrs) {
+            return loc;
+        }
         if let Some(ip) = first_public_ip(addrs) {
             return self.cached(&ip);
         }
@@ -188,6 +229,60 @@ impl GeoIp {
             }
         }
         out
+    }
+}
+
+impl GeoIp {
+    /// A static pin for these addresses: the peer's own IP first, else its
+    /// relay's, labelled "Via relay" like a looked-up relay would be. Raw IPs,
+    /// not public ones — the whole point is address space geoip refuses.
+    fn static_for(&self, addrs: &[String]) -> Option<Location> {
+        if self.statics.is_empty() {
+            return None;
+        }
+        let own = addrs
+            .iter()
+            .filter(|a| !a.contains("/p2p-circuit"))
+            .find_map(|a| self.statics.get(&ip_of(a)?).cloned());
+        own.or_else(|| {
+            addrs
+                .iter()
+                .filter_map(|a| a.split_once("/p2p-circuit").map(|(relay, _)| relay))
+                .find_map(|relay| self.statics.get(&ip_of(relay)?).cloned())
+                .map(via_relay_at)
+        })
+    }
+}
+
+/// Read a `GEOIP_STATIC_FILE` file. A file that cannot be read or parsed is an
+/// operator error worth a warning, not a crash: the map still runs, only the
+/// pins are missing.
+fn load_static(path: &str) -> HashMap<String, Location> {
+    let parsed: Result<HashMap<String, StaticEntry>, String> = std::fs::read_to_string(path)
+        .map_err(|e| e.to_string())
+        .and_then(|text| serde_json::from_str(&text).map_err(|e| e.to_string()));
+    match parsed {
+        Ok(entries) => {
+            info!("geoip: {} static location(s) from {path}", entries.len());
+            entries
+                .into_iter()
+                .map(|(ip, e)| {
+                    let loc = Location {
+                        status: "success".into(),
+                        country: e.country,
+                        city: e.city,
+                        lat: e.lat,
+                        lon: e.lon,
+                        isp: e.isp,
+                    };
+                    (ip, loc)
+                })
+                .collect()
+        }
+        Err(e) => {
+            warn!("geoip: GEOIP_STATIC_FILE {path} unusable: {e}");
+            HashMap::new()
+        }
     }
 }
 
@@ -265,12 +360,19 @@ fn public_ip_of(addr: &str) -> Option<String> {
     if addr.contains("/p2p-circuit") {
         return None;
     }
+    let raw = ip_of(addr)?;
+    let ip: IpAddr = raw.parse().ok()?;
+    is_public(&ip).then_some(raw)
+}
+
+/// The first ip4/ip6 component of a multiaddr, whatever range it is in.
+fn ip_of(addr: &str) -> Option<String> {
     let mut parts = addr.split('/').skip(1);
     while let Some(proto) = parts.next() {
         if matches!(proto, "ip4" | "ip6") {
             let raw = parts.next()?;
-            let ip: IpAddr = raw.parse().ok()?;
-            return is_public(&ip).then(|| raw.to_string());
+            raw.parse::<IpAddr>().ok()?;
+            return Some(raw.to_string());
         }
     }
     None
@@ -375,6 +477,61 @@ mod tests {
         assert_eq!(loc.isp, "Relay: AWS");
         // An unresolved relay keeps the plain sentinel, not a fake (0,0) fix.
         assert_eq!(via_relay_at(Location::unknown()).country, "Unknown");
+    }
+
+    fn pin(city: &str) -> Location {
+        Location {
+            status: "success".into(),
+            country: "Testland".into(),
+            city: city.into(),
+            lat: 1.0,
+            lon: 2.0,
+            isp: "NAT-test".into(),
+        }
+    }
+
+    #[test]
+    fn a_static_entry_pins_reserved_space_without_a_lookup() {
+        let geo = GeoIp::with_statics(HashMap::from([
+            ("198.18.0.31".to_string(), pin("Brussels")),
+            ("fdc6:1200::20".to_string(), pin("Los Angeles")),
+        ]));
+        let v4 = vec!["/ip4/198.18.0.31/tcp/8080/p2p/12D3KooWPeer".to_string()];
+        assert_eq!(geo.locate(&v4).city, "Brussels");
+        let v6 = vec!["/ip6/fdc6:1200::20/tcp/8080/p2p/12D3KooWPeer".to_string()];
+        assert_eq!(geo.locate(&v6).city, "Los Angeles");
+        // Unlisted reserved space stays unknown, not looked up.
+        let other = vec!["/ip4/198.18.0.99/tcp/8080".to_string()];
+        assert_eq!(geo.locate(&other).status, "fail");
+    }
+
+    #[test]
+    fn a_relayed_peer_borrows_its_static_relay_pin() {
+        let geo = GeoIp::with_statics(HashMap::from([(
+            "198.18.0.10".to_string(),
+            pin("North Pole"),
+        )]));
+        let circuit = vec![
+            "/ip4/198.18.0.10/tcp/8000/p2p/12D3KooWRelay/p2p-circuit/p2p/12D3KooWPeer".to_string(),
+        ];
+        let loc = geo.locate(&circuit);
+        assert_eq!(loc.status, "success");
+        assert_eq!(loc.city, "Via relay");
+        assert_eq!(loc.country, "Testland");
+        assert_eq!(loc.isp, "Relay: NAT-test");
+    }
+
+    #[test]
+    fn a_static_own_address_beats_a_static_relay() {
+        let geo = GeoIp::with_statics(HashMap::from([
+            ("198.18.0.10".to_string(), pin("North Pole")),
+            ("198.18.0.31".to_string(), pin("Brussels")),
+        ]));
+        let both = vec![
+            "/ip4/198.18.0.10/tcp/8000/p2p/12D3KooWRelay/p2p-circuit/p2p/12D3KooWPeer".to_string(),
+            "/ip4/198.18.0.31/tcp/8080/p2p/12D3KooWPeer".to_string(),
+        ];
+        assert_eq!(geo.locate(&both).city, "Brussels");
     }
 
     #[test]
