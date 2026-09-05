@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write # attach the release tarball; `read` cannot upload assets
   packages: write
 
 env:
@@ -98,3 +98,65 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # The bare-metal deployment artifact. The map host runs map-server under
+  # systemd with nginx in front — no Docker, no containerd — because the two
+  # images amount to one Rust binary and one static HTML file, and the
+  # container runtime cost more memory than both (110 MB of dockerd +
+  # containerd against a 29 MB map-server, measured on the live host).
+  #
+  # Attached to releases only: a tarball needs somewhere durable and
+  # fetchable to live, and a release tag is what KwaaiNetOps pins. Pushes to
+  # main keep building sha-tagged images for anyone still running compose.
+  release-binary:
+    name: Release tarball (x86_64-linux-gnu)
+    needs: test
+    if: github.event_name == 'release'
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # Same reason as the test job: [patch.crates-io] points at this output.
+      - name: Fetch and patch dependencies
+        working-directory: map-server
+        run: bash patches/fetch-patches.sh
+
+      - name: Build
+        working-directory: map-server
+        run: cargo build --release --locked
+
+      # ubuntu-22.04 is glibc 2.35, older than any host we deploy to — the
+      # safe direction, since a binary built against an older glibc runs on a
+      # newer one but not the reverse.
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.release.tag_name }}"
+          DIR="map-server-$TAG-x86_64-unknown-linux-gnu"
+          mkdir -p "$DIR"
+          cp map-server/target/release/map-server "$DIR/"
+          # The frontend is a single static page plus its nginx config; both
+          # ship here so the host needs nothing from a registry.
+          cp docker/kwaainet_health/kwaainet.html "$DIR/index.html"
+          cp docker/map-nginx.conf "$DIR/map-nginx.conf"
+          tar -czf "$DIR.tar.gz" "$DIR"
+          sha256sum "$DIR.tar.gz" > "$DIR.tar.gz.sha256"
+          echo "tarball=$DIR.tar.gz" >> "$GITHUB_OUTPUT"
+          ./"$DIR"/map-server --version || true
+          ldd "$DIR/map-server" | head -5
+
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            "${{ steps.package.outputs.tarball }}" \
+            "${{ steps.package.outputs.tarball }}.sha256" \
+            --repo "${{ github.repository }}" --clobber
