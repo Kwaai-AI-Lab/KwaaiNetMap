@@ -110,9 +110,14 @@ impl Location {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerIpInfo {
     pub location: Location,
-    /// Observed multiaddrs. The page prefers these over `using_relay` when
-    /// deciding Direct vs Relay, since a self-report can lie.
+    /// Observed multiaddrs — the ones that justify `reachability`.
     pub multiaddrs: Vec<String>,
+    /// How the observer reaches the peer: `direct`, `punched` (DCUtR through
+    /// its NAT), `relayed`, or `inbound` (it dialed us; nothing proves anyone
+    /// can dial it). The page labels off this; absent on older snapshots, where
+    /// it falls back to reading the multiaddrs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reachability: Option<String>,
 }
 
 impl Default for PeerIpInfo {
@@ -120,6 +125,7 @@ impl Default for PeerIpInfo {
         Self {
             location: Location::unknown(),
             multiaddrs: Vec::new(),
+            reachability: None,
         }
     }
 }

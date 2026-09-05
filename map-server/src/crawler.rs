@@ -17,7 +17,7 @@ use anyhow::Result;
 use chrono::Utc;
 use kwaai_hivemind_dht::protocol::{FindRequest, FindResponse, NodeInfo, RequestAuthInfo};
 use kwaai_hivemind_dht::PROTOCOL_FIND;
-use kwaai_p2p::{NetworkHandle, PeerId};
+use kwaai_p2p::{Direction, NetworkHandle, PeerId};
 use prost::Message as _;
 use sha1::{Digest, Sha1};
 use tracing::{debug, info, warn};
@@ -173,7 +173,10 @@ async fn crawl_once(
     let dial_errors = connect_discovered_peers(handle, &discovered).await;
 
     let addrs = observed_addrs(handle).await;
-    let flat: Vec<String> = addrs.values().flatten().cloned().collect();
+    let flat: Vec<String> = addrs
+        .values()
+        .flat_map(|o| o.addrs.iter().cloned())
+        .collect();
     let mut ips = public_ips(&flat);
     ips.extend(geo.resolve_relays(&relay_dns_names(&flat)).await);
     geo.warm(&ips).await;
@@ -533,14 +536,58 @@ async fn connect_discovered_peers(
         .await
 }
 
-/// Addresses of every peer the observer currently holds a connection to.
+/// One connection the observer holds, reduced to what classification needs.
+#[derive(Debug, Clone)]
+struct Conn {
+    addr: String,
+    direction: Direction,
+    /// Our circuit listener, for an inbound connection that arrived relayed.
+    via: Option<String>,
+    dcutr: bool,
+}
+
+/// How the observer reaches a peer, in the order the evidence is trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reachability {
+    /// We dialed a plain address and it answered.
+    Direct,
+    /// Direct now, but only because DCUtR punched through the peer's NAT.
+    Punched,
+    /// Only through a relay circuit.
+    Relayed,
+    /// The peer dialed us and we hold nothing else. Its address is the source
+    /// of *its* dial — a NAT's ephemeral mapping as often as not — so it says
+    /// where the peer is, not that anyone can dial it.
+    Inbound,
+}
+
+impl Reachability {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Punched => "punched",
+            Self::Relayed => "relayed",
+            Self::Inbound => "inbound",
+        }
+    }
+}
+
+/// What the crawl observed about one peer.
+#[derive(Debug, Clone)]
+struct Observed {
+    /// The addresses that justify `reachability`, and only those.
+    addrs: Vec<String>,
+    reachability: Reachability,
+}
+
+/// Every peer the observer currently holds a connection to, classified.
 ///
 /// This is the only source of peer addresses: DHT records carry peer ids, never
 /// addresses — which is why the crawl dials every discovered peer first.
 ///
 /// `list_peers` reports one entry per *connection*, so a peer reached more than
-/// one way appears more than once; the addresses are grouped back per peer.
-async fn observed_addrs(handle: &NetworkHandle) -> HashMap<String, Vec<String>> {
+/// one way appears more than once; the connections are grouped back per peer.
+async fn observed_addrs(handle: &NetworkHandle) -> HashMap<String, Observed> {
     let peers = match handle.list_peers().await {
         Ok(p) => p,
         Err(e) => {
@@ -549,13 +596,78 @@ async fn observed_addrs(handle: &NetworkHandle) -> HashMap<String, Vec<String>> 
         }
     };
 
-    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    let mut conns: HashMap<String, Vec<Conn>> = HashMap::new();
     for peer in peers {
-        out.entry(peer.peer_id.to_base58())
+        conns
+            .entry(peer.peer_id.to_base58())
             .or_default()
-            .push(peer.addr.to_string());
+            .push(Conn {
+                addr: peer.addr.to_string(),
+                direction: peer.direction,
+                via: peer.via.map(|m| m.to_string()),
+                dcutr: peer.dcutr,
+            });
     }
-    out
+    conns
+        .into_iter()
+        .map(|(id, c)| {
+            let observed = classify(&id, &c);
+            (id, observed)
+        })
+        .collect()
+}
+
+/// Reduce a peer's connections to one verdict. The observer listens on a
+/// public port, so NATed peers dial *it*; before this, the source address of
+/// such an inbound connection was reported like an address we had dialed, and
+/// a relay-only node behind symmetric NAT read as directly reachable whenever
+/// it happened to have dialed in before the crawl.
+fn classify(peer_id: &str, conns: &[Conn]) -> Observed {
+    let is_circuit = |c: &Conn| c.addr.contains("/p2p-circuit") || c.via.is_some();
+    let outbound = |c: &Conn| c.direction == Direction::Outbound;
+
+    if conns.iter().any(|c| c.dcutr) {
+        return Observed {
+            addrs: conns
+                .iter()
+                .filter(|c| c.dcutr)
+                .map(|c| c.addr.clone())
+                .collect(),
+            reachability: Reachability::Punched,
+        };
+    }
+    let direct: Vec<String> = conns
+        .iter()
+        .filter(|c| outbound(c) && !is_circuit(c))
+        .map(|c| c.addr.clone())
+        .collect();
+    if !direct.is_empty() {
+        return Observed {
+            addrs: direct,
+            reachability: Reachability::Direct,
+        };
+    }
+    let relayed: Vec<String> = conns
+        .iter()
+        .filter(|c| is_circuit(c))
+        .map(|c| match &c.via {
+            // An inbound relayed connection's own addr is a bare /p2p/<peer>;
+            // the circuit is on our listener side. Rebuild the full form so
+            // geoip and the page read it like an outbound circuit.
+            Some(via) => format!("{via}/p2p/{peer_id}"),
+            None => c.addr.clone(),
+        })
+        .collect();
+    if !relayed.is_empty() {
+        return Observed {
+            addrs: relayed,
+            reachability: Reachability::Relayed,
+        };
+    }
+    Observed {
+        addrs: conns.iter().map(|c| c.addr.clone()).collect(),
+        reachability: Reachability::Inbound,
+    }
 }
 
 // ── Snapshot assembly ─────────────────────────────────────────────────────────
@@ -585,7 +697,7 @@ fn build_snapshot(
     models: &[Model],
     per_model: BTreeMap<String, HashMap<String, PeerModelEntry>>,
     capability_peers: HashMap<String, ServerInfo>,
-    addrs: &HashMap<String, Vec<String>>,
+    addrs: &HashMap<String, Observed>,
     dial_errors: &BTreeMap<String, String>,
     geo: &GeoIp,
 ) -> Snapshot {
@@ -599,7 +711,7 @@ fn build_snapshot(
     // relayed through another *node* can borrow its relay's pin.
     let known: HashMap<String, Location> = addrs
         .iter()
-        .map(|(id, a)| (id.clone(), geo.locate(a)))
+        .map(|(id, o)| (id.clone(), geo.locate(&o.addrs)))
         .collect();
 
     for model in models {
@@ -625,16 +737,33 @@ fn build_snapshot(
                 }
             }
 
-            let peer_addrs = addrs.get(peer_id).cloned().unwrap_or_default();
+            let peer_ip_info = match addrs.get(peer_id) {
+                // A node that says it needs a relay, seen only because it
+                // dialed us: its egress address is real, but it asked not to
+                // be placed by it. Keep it a relayed peer of unknown place.
+                Some(o)
+                    if o.reachability == Reachability::Inbound
+                        && entry.info.using_relay == Some(true) =>
+                {
+                    PeerIpInfo {
+                        location: Location::via_relay(),
+                        multiaddrs: Vec::new(),
+                        reachability: Some(Reachability::Relayed.as_str().into()),
+                    }
+                }
+                Some(o) => PeerIpInfo {
+                    location: locate_row(geo, &o.addrs, &known),
+                    multiaddrs: o.addrs.clone(),
+                    reachability: Some(o.reachability.as_str().into()),
+                },
+                None => PeerIpInfo::default(),
+            };
             server_rows.push(ServerRow {
                 short_peer_id: short_peer_id(peer_id),
                 peer_id: peer_id.clone(),
                 show_public_name: entry.info.public_name.is_some(),
                 state: entry.info.state.clone(),
-                peer_ip_info: PeerIpInfo {
-                    location: locate_row(geo, &peer_addrs, &known),
-                    multiaddrs: peer_addrs,
-                },
+                peer_ip_info,
                 span: PeerSpan {
                     peer_id: peer_id.clone(),
                     // The node's own declared range, verbatim, which is what v1
@@ -804,6 +933,90 @@ fn tier_from_vc_count(count: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn conn(addr: &str, direction: Direction, via: Option<&str>, dcutr: bool) -> Conn {
+        Conn {
+            addr: addr.into(),
+            direction,
+            via: via.map(str::to_string),
+            dcutr,
+        }
+    }
+
+    #[test]
+    fn an_inbound_only_plain_connection_is_not_a_dialable_address() {
+        // node-h on the bed: symmetric NAT, dialed the observer, random port.
+        let o = classify(
+            "12D3KooWPeer",
+            &[conn(
+                "/ip4/198.18.0.41/tcp/28456",
+                Direction::Inbound,
+                None,
+                false,
+            )],
+        );
+        assert_eq!(o.reachability, Reachability::Inbound);
+        assert_eq!(o.addrs, vec!["/ip4/198.18.0.41/tcp/28456"]);
+    }
+
+    #[test]
+    fn a_punched_connection_outranks_everything() {
+        let o = classify(
+            "12D3KooWPeer",
+            &[
+                conn(
+                    "/ip4/198.18.0.10/tcp/8000/p2p/QmRelay/p2p-circuit/p2p/12D3KooWPeer",
+                    Direction::Outbound,
+                    None,
+                    false,
+                ),
+                conn("/ip4/198.18.0.31/tcp/8080", Direction::Outbound, None, true),
+            ],
+        );
+        assert_eq!(o.reachability, Reachability::Punched);
+        assert_eq!(o.addrs, vec!["/ip4/198.18.0.31/tcp/8080"]);
+    }
+
+    #[test]
+    fn an_outbound_plain_dial_is_direct_even_beside_an_inbound_one() {
+        let o = classify(
+            "12D3KooWPeer",
+            &[
+                conn(
+                    "/ip4/93.184.216.34/tcp/54321",
+                    Direction::Inbound,
+                    None,
+                    false,
+                ),
+                conn(
+                    "/ip4/93.184.216.34/tcp/8080",
+                    Direction::Outbound,
+                    None,
+                    false,
+                ),
+            ],
+        );
+        assert_eq!(o.reachability, Reachability::Direct);
+        assert_eq!(o.addrs, vec!["/ip4/93.184.216.34/tcp/8080"]);
+    }
+
+    #[test]
+    fn an_inbound_relayed_connection_is_rebuilt_as_a_circuit_address() {
+        let o = classify(
+            "12D3KooWPeer",
+            &[conn(
+                "/p2p/12D3KooWPeer",
+                Direction::Inbound,
+                Some("/ip4/198.18.0.10/tcp/8000/p2p/QmRelay/p2p-circuit"),
+                false,
+            )],
+        );
+        assert_eq!(o.reachability, Reachability::Relayed);
+        assert_eq!(
+            o.addrs,
+            vec!["/ip4/198.18.0.10/tcp/8000/p2p/QmRelay/p2p-circuit/p2p/12D3KooWPeer"]
+        );
+    }
 
     #[test]
     fn a_peer_relayed_through_a_known_node_borrows_its_pin() {

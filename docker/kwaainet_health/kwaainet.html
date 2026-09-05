@@ -958,6 +958,13 @@
         // hole-punched: reachable to a DCUtR-capable dialer, not to anyone.
         function getConnectionType(server) {
             const info = server.span && server.span.server_info;
+            // A map-server that classified the connection itself — by which
+            // side dialed, and whether DCUtR punched — is believed outright.
+            const verdict = server.peer_ip_info && server.peer_ip_info.reachability;
+            if (verdict) {
+                return { direct: "Direct", punched: "NAT", relayed: "Relay",
+                         inbound: info && info.using_relay ? "Relay" : "Direct" }[verdict] || "Unknown";
+            }
             const addrs = server.peer_ip_info && server.peer_ip_info.multiaddrs;
             if (Array.isArray(addrs) && addrs.length > 0) {
                 if (addrs.some(a => typeof a === 'string' && a.includes('/p2p-circuit'))) {
