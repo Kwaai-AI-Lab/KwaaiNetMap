@@ -158,12 +158,27 @@
         #map .site { stroke: #fff; stroke-width: 1.5; cursor: pointer; }
         #map .site:hover { stroke: #333; }
         #map .site-count {
-            font-size: 11px;
             font-weight: bold;
             fill: #fff;
             text-anchor: middle;
             pointer-events: none;
         }
+        #map .leaf-leg { stroke: #555; }
+
+        #map .map-button {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            padding: 4px 10px;
+            background: #fff;
+            border: 1px solid #bbb;
+            border-radius: 4px;
+            font-size: 1.3rem;
+            cursor: pointer;
+            user-select: none;
+        }
+        #map .map-button:hover { background: #f0f0f0; }
+        #map .map-button-home { right: 76px; }
 
         #map .map-chip {
             position: absolute;
@@ -580,7 +595,6 @@
                 <table id="model-table" class="data-table">
                     <thead>
                         <tr>
-                            <th data-sort="model">Model <span class="sort-indicator"></span></th>
                             <th data-sort="state">Status <span class="sort-indicator"></span></th>
                             <th data-sort="location">Location <span class="sort-indicator"></span></th>
                             <th data-sort="publicName">Public Name <span class="sort-indicator"></span></th>
@@ -636,7 +650,9 @@
             // If we have current data, immediately update the view
             if (currentData && Object.keys(currentData).length > 0) {
                 if (tabId === 'map-tab' && map) {
-                    updateMapView(currentData);
+                    // The container had no size while hidden; lay out now
+                    // (which also draws the current data).
+                    layoutMap();
                 }
                 else if (tabId === 'table-tab') {
                     // Immediately update table with current data
@@ -925,7 +941,9 @@
         function nameAndVersion(server) {
             const info = (server.span && server.span.server_info) || {};
             const name = (info.public_name || "").replace(/\/v\d[\w.+-]*$/, "");
-            return { name: name || "N/A", version: info.version || "N/A" };
+            // The DHT field reads `kwaai-0.6.8`; the table wants the number.
+            const version = (info.version || "").replace(/^[^-]*-/, "");
+            return { name: name || "N/A", version: version || "N/A" };
         }
 
         // Helper function to get connection type
@@ -1000,6 +1018,12 @@
         const WORLD_ATLAS_URL = 'https://cdn.jsdelivr.net/npm/world-atlas@2.0.2/countries-110m.json';
         const MAP_MIN_RADIUS = 6;
         const MAP_MAX_ZOOM = 12;
+        // Where the eye lands first. The projection is centred on the Atlantic
+        // (central meridian 30°W) so North America and Europe share the middle
+        // band, and the page opens zoomed on the North Atlantic — Los Angeles
+        // to Moscow — where most of the network is. "World" zooms back out.
+        const MAP_CENTRAL_MERIDIAN = -30;
+        const MAP_HOME = { lon: -40, lat: 38, zoom: 1.85 };
 
         const STATUS_COLORS = { online: '#2e8b57', joining: '#e8891d', unreachable: '#d0342c', offline: '#8a8a8a' };
         // A site's colour is its most alarming node's.
@@ -1007,18 +1031,15 @@
 
         function initMap() {
             const container = document.getElementById('map');
-            const projection = d3.geoEqualEarth();
+            const projection = d3.geoEqualEarth().rotate([-MAP_CENTRAL_MERIDIAN, 0]);
             const path = d3.geoPath(projection);
 
-            // Fit the sphere into a fixed 1000-wide viewBox; the SVG scales to
-            // its container from there, so a resize costs nothing.
-            projection.fitWidth(1000, { type: 'Sphere' });
-            const [[x0, y0], [x1, y1]] = path.bounds({ type: 'Sphere' });
-            const width = 1000, height = Math.ceil(y1 - y0);
-            projection.translate([projection.translate()[0], projection.translate()[1] - y0]);
-
+            // The viewBox is 1000 wide and takes the container's aspect, with
+            // the sphere fitted and centred in it, so the map fills the frame
+            // with no letterbox and the pan clamp is the frame edge. Resizing
+            // the window re-lays it out (see layoutMap).
+            const width = 1000;
             const svg = d3.select(container).append('svg')
-                .attr('viewBox', `0 0 ${width} ${height}`)
                 .attr('preserveAspectRatio', 'xMidYMid meet');
             const g = svg.append('g');
 
@@ -1029,24 +1050,33 @@
 
             const zoom = d3.zoom()
                 .scaleExtent([1, MAP_MAX_ZOOM])
-                .translateExtent([[0, 0], [width, height]])
                 .on('zoom', (event) => {
                     g.attr('transform', event.transform);
                     // Keep pins the same size on screen whatever the zoom.
                     map.k = event.transform.k;
-                    sites.selectAll('circle').attr('r', d => siteRadius(d) / map.k)
-                        .attr('stroke-width', 1.5 / map.k);
-                    sites.selectAll('text').attr('font-size', `${11 / map.k}px`)
-                        .attr('dy', `${4 / map.k}px`);
+                    restyleSites();
                     closePopup();
                 });
             svg.call(zoom).on('dblclick.zoom', null);
-            svg.on('click', (event) => { if (event.target.tagName !== 'circle') closePopup(); });
+            svg.on('click', (event) => {
+                if (event.target.tagName === 'circle') return;
+                closePopup();
+                collapseSite();
+            });
 
             const chip = d3.select(container).append('div').attr('class', 'map-chip').style('display', 'none');
             const popup = d3.select(container).append('div').attr('class', 'map-popup').style('display', 'none');
 
-            map = { container, svg, g, projection, path, zoom, land, sites, chip, popup, k: 1, width, height };
+            map = { container, svg, g, projection, path, zoom, land, sites, chip, popup, k: 1, width, height: 0, home: null };
+
+            d3.select(container).append('div').attr('class', 'map-button').text('World')
+                .attr('title', 'Zoom out to the whole world')
+                .on('click', () => svg.transition().duration(600).call(zoom.transform, d3.zoomIdentity));
+            d3.select(container).append('div').attr('class', 'map-button map-button-home').text('Home')
+                .attr('title', 'Back to the North Atlantic')
+                .on('click', () => svg.transition().duration(600).call(zoom.transform, map.home));
+
+            layoutMap();
 
             d3.json(WORLD_ATLAS_URL).then(world => {
                 const countries = topojson.feature(world, world.objects.countries);
@@ -1057,12 +1087,99 @@
             });
         }
 
+        // Size the viewBox to the container, fit the sphere, redraw the base
+        // layers and return to the home view. Called at init and on resize;
+        // the map is hidden on the other tabs, so a zero-sized container keeps
+        // the previous layout.
+        function layoutMap() {
+            const { container, svg, g, projection, path, width } = map;
+            const box = container.getBoundingClientRect();
+            if (box.width === 0 || box.height === 0) return;
+            const height = Math.round(width * box.height / box.width);
+
+            projection.fitSize([width, height], { type: 'Sphere' });
+            const [[x0, y0], [x1, y1]] = path.bounds({ type: 'Sphere' });
+            const [tx, ty] = projection.translate();
+            projection.translate([tx + (width - (x1 + x0)) / 2, ty + (height - (y1 + y0)) / 2]);
+
+            map.height = height;
+            svg.attr('viewBox', `0 0 ${width} ${height}`);
+            g.selectAll('path.sphere, path.graticule, path.land').attr('d', path);
+            // Pan no further than the sphere itself: a zoomed view then rests
+            // with the pole at the frame edge rather than on empty margin.
+            // d3.zoom measures the viewport in element pixels by default; tell
+            // it the viewBox, since that is the unit the clamp is in.
+            const viewport = [[0, 0], [width, height]];
+            const sphere = path.bounds({ type: 'Sphere' });
+            map.zoom.extent(viewport).translateExtent(sphere);
+
+            // d3 constrains gestures, not programmatic transforms, so the home
+            // view is put through the same clamp by hand.
+            const [hx, hy] = projection([MAP_HOME.lon, MAP_HOME.lat]);
+            const centred = d3.zoomIdentity
+                .translate(width / 2 - MAP_HOME.zoom * hx, height / 2 - MAP_HOME.zoom * hy)
+                .scale(MAP_HOME.zoom);
+            map.home = map.zoom.constrain()(centred, viewport, sphere);
+            // Applying a transform runs the zoom handler, which reads `map`.
+            svg.call(map.zoom.transform, map.home);
+            if (currentData && currentData.model_reports) updateMapView(currentData);
+        }
+
         function closePopup() {
             if (map) map.popup.style('display', 'none');
         }
 
+        // A shared site is drawn bigger, and big enough to hold its count.
         function siteRadius(site) {
-            return MAP_MIN_RADIUS + 2.5 * Math.sqrt(site.nodes.length - 1);
+            const n = site.nodes.length;
+            return n > 1 ? MAP_MIN_RADIUS + 3 + 2 * Math.sqrt(n - 1) : MAP_MIN_RADIUS;
+        }
+
+        const siteKey = (site) => `${site.lat},${site.lon}`;
+
+        // Everything drawn in screen pixels: divided by the zoom so pins,
+        // badges and the expanded ring keep their size on screen.
+        function restyleSites() {
+            const k = map.k;
+            map.sites.selectAll('g.site-group > circle')
+                .attr('r', d => siteRadius(d) / k)
+                .attr('stroke-width', 1.5 / k);
+            map.sites.selectAll('g.site-group > text')
+                .attr('font-size', `${10 / k}px`);
+            map.sites.selectAll('g.leaf-group').attr('transform', d => {
+                const [dx, dy] = leafOffset(d);
+                return `translate(${dx / k},${dy / k})`;
+            });
+            map.sites.selectAll('g.leaf-group circle')
+                .attr('r', MAP_MIN_RADIUS / k)
+                .attr('stroke-width', 1.5 / k);
+            map.sites.selectAll('line.leaf-leg')
+                .attr('stroke-width', 1 / k)
+                .attr('x2', d => leafOffset(d)[0] / k)
+                .attr('y2', d => leafOffset(d)[1] / k);
+        }
+
+        // Where a leaf sits when its site is expanded: a ring around the site
+        // wide enough for its members, in screen pixels.
+        function leafOffset(leaf) {
+            const n = leaf.site.nodes.length;
+            const ring = 22 + 2.5 * n;
+            const angle = (2 * Math.PI * leaf.i) / n - Math.PI / 2;
+            return [ring * Math.cos(angle), ring * Math.sin(angle)];
+        }
+
+        // Click on a shared site fans its nodes out (the old marker cluster's
+        // spiderfy); click on the site again, or on the map, folds them back.
+        function expandSite(site) {
+            map.expanded = map.expanded === siteKey(site) ? null : siteKey(site);
+            updateMapView(currentData);
+        }
+
+        function collapseSite() {
+            if (map && map.expanded) {
+                map.expanded = null;
+                updateMapView(currentData);
+            }
         }
 
         function siteColor(site) {
@@ -1151,25 +1268,67 @@
                 .data(sites, d => `${d.lat},${d.lon}`)
                 .join(enter => {
                     const gr = enter.append('g').attr('class', 'site-group');
-                    gr.append('circle').attr('class', 'site');
-                    gr.append('text').attr('class', 'site-count');
+                    gr.append('circle').attr('class', 'site').append('title');
+                    gr.append('text').attr('class', 'site-count').attr('dominant-baseline', 'central');
                     return gr;
                 });
             groups.attr('transform', d => `translate(${d.x},${d.y})`);
-            groups.select('circle')
-                .attr('r', d => siteRadius(d) / map.k)
-                .attr('stroke-width', 1.5 / map.k)
+
+            // Leaves first so they draw under their site's circle.
+            const expanded = sites.find(site => siteKey(site) === map.expanded);
+            const leafData = expanded
+                ? expanded.nodes.map((node, i) => ({ node, site: expanded, i }))
+                : [];
+            map.sites.selectAll('g.leaf-group')
+                .data(leafData, d => d.node.server.peer_id)
+                .join(enter => {
+                    const gr = enter.append('g').attr('class', 'leaf-group');
+                    gr.append('circle').attr('class', 'site leaf');
+                    gr.append('title');
+                    return gr;
+                })
+                .each(function (d) {
+                    d3.select(this).select('circle')
+                        .attr('fill', STATUS_COLORS[d.node.server.state] || STATUS_COLORS.offline)
+                        .on('click', (event) => {
+                            event.stopPropagation();
+                            const [x, y] = d3.pointer(event, map.container);
+                            openPopup({ label: d.site.label, nodes: [d.node] }, x, y);
+                        });
+                    d3.select(this).select('title').text(nameAndVersion(d.node.server).name);
+                });
+            const legs = groups.filter(d => d === expanded).selectAll('line.leaf-leg')
+                .data(leafData, d => d.node.server.peer_id)
+                .join('line').attr('class', 'leaf-leg').attr('x1', 0).attr('y1', 0);
+            groups.filter(d => d !== expanded).selectAll('line.leaf-leg').remove();
+            // Leaves are positioned relative to their site, so parent them there.
+            groups.filter(d => d === expanded).each(function () {
+                const parent = this;
+                map.sites.selectAll('g.leaf-group').each(function () { parent.appendChild(this); });
+            });
+            groups.each(function () {
+                // Site circle and count on top of legs and leaves.
+                const el = d3.select(this);
+                this.appendChild(el.select('circle.site:not(.leaf)').node());
+                this.appendChild(el.select('text').node());
+            });
+
+            groups.select('circle.site:not(.leaf)')
                 .attr('fill', siteColor)
                 .on('click', (event, d) => {
                     event.stopPropagation();
+                    if (d.nodes.length > 1) {
+                        closePopup();
+                        expandSite(d);
+                        return;
+                    }
                     const [x, y] = d3.pointer(event, map.container);
                     openPopup(d, x, y);
                 })
-                .append('title').text(d => `${d.label}: ${d.nodes.length} node${d.nodes.length === 1 ? '' : 's'}`);
+                .select('title').text(d => `${d.label}: ${d.nodes.length} node${d.nodes.length === 1 ? '' : 's'}`);
             groups.select('text')
-                .attr('font-size', `${11 / map.k}px`)
-                .attr('dy', `${4 / map.k}px`)
                 .text(d => d.nodes.length > 1 ? d.nodes.length : '');
+            restyleSites();
 
             // Unlocated nodes get a chip in the corner rather than a fake pin.
             if (unknown.nodes.length > 0) {
@@ -1255,7 +1414,7 @@
             if (pageData.length === 0) {
                 const row = document.createElement('tr');
                 const cell = document.createElement('td');
-                cell.colSpan = 9; // Updated column count
+                cell.colSpan = 8; // Updated column count
                 cell.textContent = 'No data found';
                 cell.style.textAlign = 'center';
                 row.appendChild(cell);
@@ -1266,10 +1425,6 @@
             pageData.forEach(rowData => {
                 const row = document.createElement('tr');
                 
-                // Model
-                const modelCell = document.createElement('td');
-                modelCell.textContent = rowData.model;
-                row.appendChild(modelCell);
                 
                 // Status
                 const stateCell = document.createElement('td');
@@ -1886,8 +2041,9 @@
         window.addEventListener('resize', function() {
             const activeTab = document.querySelector('.tab.active').getAttribute('data-tab');
             
-            // The map is a viewBox SVG and rescales itself.
-            if (activeTab === 'topology-tab' && network) {
+            if (activeTab === 'map-tab' && map) {
+                layoutMap();
+            } else if (activeTab === 'topology-tab' && network) {
                 network.fit();
             }
         });
