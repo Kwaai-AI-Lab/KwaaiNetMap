@@ -322,26 +322,17 @@
             background-color: #e9e9e9;
         }
 
-        /* Make the peer-ID cell a positioning context so the copy button
-           can sit absolutely inside it without affecting row height.
-           The extra right-padding reserves space for the absolute button
-           so the cell's auto width includes it and the ID text never
-           overlaps with the icon. */
-        .data-table td.peer-id-cell {
-            position: relative;
-            padding-right: 24px;
-        }
         .peer-id-copy {
-            /* The button is positioned absolutely so it doesn't influence
-               the row's line-box height. Without this, FA's icon glyph
-               metrics (or even just the <button>'s default inline-block
-               line box) push the row ~9px taller than data-only rows.
-               We pin it to the right of the cell padding-end and centre
-               it vertically. */
-            position: absolute;
-            top: 50%;
-            right: 12px;
-            transform: translateY(-50%);
+            /* Flows inline right after the ID rather than pinned to the
+               cell's far edge, where a wide column left it stranded. As a
+               plain inline with line-height 1 it adds nothing to the row's
+               line box; a <button>'s default inline-block would push the
+               row ~9px taller than data-only rows. */
+            display: inline;
+            /* Milligram's 10px bottom margin on <button> is the one thing
+               that does grow the row, so the shorthand sets all four. */
+            margin: 0 0 0 0.4em;
+            vertical-align: baseline;
             /* Milligram (loaded earlier in this file) styles every <button>
                with a 3.8rem-tall purple pill. We undo all of that
                explicitly: height, padding, border-radius, text-transform,
@@ -445,12 +436,14 @@
             font-size: 14px;
             flex: 1;
             max-width: 300px;
-            margin-right: 10px;
+            /* Milligram gives inputs and labels a bottom margin; centred
+               flex items centre their margin boxes, so the label sat low. */
+            margin: 0 10px 0 0;
         }
         
         .table-controls label {
             font-weight: bold;
-            margin-right: 10px;
+            margin: 0 10px 0 0;
         }
         
         /* Pagination */
@@ -615,9 +608,10 @@
                             <th data-sort="peerId">Peer ID <span class="sort-indicator"></span></th>
                             <th data-sort="version">Version <span class="sort-indicator"></span></th>
                             <th data-sort="connectionType">Connection <span class="sort-indicator"></span></th>
+                            <th data-sort="model">Model <span class="sort-indicator"></span></th>
                             <th data-sort="state">Sharding <span class="sort-indicator"></span></th>
-                            <th data-sort="vpk">VPK <span class="sort-indicator"></span></th>
                             <th data-sort="throughput">Tok/sec <span class="sort-indicator"></span></th>
+                            <th data-sort="vpk">VPK <span class="sort-indicator"></span></th>
                         </tr>
                     </thead>
                     <tbody>
@@ -1025,15 +1019,22 @@
         // JOINING is two situations. A node only claims Loading while a shard is
         // actually loading; everything else that is up but not serving reads
         // Idle, which promises nothing — including nodes too old to say.
-        // The range rides on the label only where it means something: the
-        // blocks a Serving node answers for, or a Loading node is fetching.
-        // Idle and Departed nodes still announce one, but it promises nothing.
-        const blockRange = (server) => server.span && server.span.start != null ? `[${server.span.start}:${server.span.end}]` : '';
         const serverStatus = (server) => {
             const info = (server.span && server.span.server_info) || {};
-            if (server.state === 'online') return `Serving ${blockRange(server)}`;
-            if (server.state === 'joining' && info.shard_loading) return `Loading ${blockRange(server)}`;
+            if (server.state === 'online') return 'Serving';
+            if (server.state === 'joining' && info.shard_loading) return 'Loading';
             return statusLabel(server.state);
+        };
+        // The block range rides on the model only where it means something:
+        // the blocks a Serving node answers for, or a Loading node is fetching.
+        // Idle and Departed nodes still announce one, but it promises nothing.
+        const NO_MODEL = 'No model';
+        const modelLabel = (server, model) => {
+            const name = model || NO_MODEL;
+            const status = serverStatus(server);
+            const hasRange = server.span && server.span.start != null;
+            return (status === 'Serving' || status === 'Loading') && hasRange
+                ? `${name} [${server.span.start}:${server.span.end}]` : name;
         };
 
         // A node announces a role only when the service behind it answers
@@ -1055,7 +1056,6 @@
         // over kad or found named in the DHT, serving or not — shaped like the
         // v1 server rows the helpers above read. A map-server without `peers`
         // falls back to flattening model_reports, so the older API still renders.
-        const NO_MODEL = 'No model';
         function peerRows(data) {
             if (Array.isArray(data.peers)) {
                 return data.peers.map(p => ({
@@ -1282,7 +1282,7 @@
             const connectionType = getConnectionType(server);
             const connectionTypeColor = connectionTypeStyle(connectionType).color;
             return `<div class="site-node">
-                <b>Model:</b> ${report.name}<br>
+                <b>Model:</b> ${modelLabel(server, report.name)}<br>
                 <b>Sharding:</b> <span class="${statusClass(server.state)}">${serverStatus(server)}</span><br>
                 <b>VPK:</b> ${roleCell(vpkRole(server))}<br>
                 <b>Public Name:</b> ${publicName}<br>
@@ -1493,7 +1493,7 @@
             if (pageData.length === 0) {
                 const row = document.createElement('tr');
                 const cell = document.createElement('td');
-                cell.colSpan = 8;
+                cell.colSpan = 9;
                 cell.textContent = 'No data found';
                 cell.style.textAlign = 'center';
                 row.appendChild(cell);
@@ -1592,20 +1592,25 @@
                 connectionTypeCell.innerHTML = getConnectionTypeHtml(rowData.connectionType);
                 row.appendChild(connectionTypeCell);
 
+                // Model
+                const modelCell = document.createElement('td');
+                modelCell.textContent = rowData.model;
+                row.appendChild(modelCell);
+
                 // Status
                 const stateCell = document.createElement('td');
                 stateCell.innerHTML = `<span class="${statusClass(rowData.stateKey)}">${rowData.state}</span>`;
                 row.appendChild(stateCell);
 
-                // VPK role
-                const vpkCell = document.createElement('td');
-                vpkCell.innerHTML = roleCell(rowData.vpk);
-                row.appendChild(vpkCell);
-
                 // Throughput
                 const throughputCell = document.createElement('td');
                 throughputCell.innerHTML = getThroughputHtml(rowData.throughput);
                 row.appendChild(throughputCell);
+
+                // VPK role
+                const vpkCell = document.createElement('td');
+                vpkCell.innerHTML = roleCell(rowData.vpk);
+                row.appendChild(vpkCell);
 
                 tableBody.appendChild(row);
             });
@@ -1829,7 +1834,7 @@
                         location: locationInfo,
                         throughput: throughput ? throughput.toFixed(2) : "N/A",
                         connectionType: connectionType,
-                        title: `Model: ${modelName}<br>Sharding: ${serverStatus(server)}<br>VPK: ${vpkRole(server) || "—"}<br>Location: ${locationInfo}`,
+                        title: `Model: ${modelLabel(server, modelName)}<br>Sharding: ${serverStatus(server)}<br>VPK: ${vpkRole(server) || "—"}<br>Location: ${locationInfo}`,
                         borderWidth: 2,
                         level: 2,
                         // Different shape based on connection type
@@ -1984,7 +1989,7 @@
                     const connectionType = getConnectionType(server);
                     
                     tableData.push({
-                        model: model || NO_MODEL,
+                        model: modelLabel(server, model),
                         location: locationInfo,
                         publicName: publicName,
                         version: version,
