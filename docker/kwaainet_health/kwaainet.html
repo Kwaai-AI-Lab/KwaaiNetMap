@@ -617,8 +617,8 @@
                             <th data-sort="connectionType">Connection <span class="sort-indicator"></span></th>
                             <th data-sort="model">Model <span class="sort-indicator"></span></th>
                             <th data-sort="state">Sharding <span class="sort-indicator"></span></th>
-                            <th data-sort="vpk">VPK <span class="sort-indicator"></span></th>
                             <th data-sort="throughput">Tok/sec <span class="sort-indicator"></span></th>
+                            <th data-sort="vpk">VPK <span class="sort-indicator"></span></th>
                         </tr>
                     </thead>
                     <tbody>
@@ -1609,15 +1609,15 @@
                 stateCell.innerHTML = `<span class="${statusClass(rowData.stateKey)}">${rowData.state}</span>`;
                 row.appendChild(stateCell);
 
-                // VPK role
-                const vpkCell = document.createElement('td');
-                vpkCell.innerHTML = roleCell(rowData.vpk);
-                row.appendChild(vpkCell);
-
                 // Throughput
                 const throughputCell = document.createElement('td');
                 throughputCell.innerHTML = getThroughputHtml(rowData.throughput);
                 row.appendChild(throughputCell);
+
+                // VPK role
+                const vpkCell = document.createElement('td');
+                vpkCell.innerHTML = roleCell(rowData.vpk);
+                row.appendChild(vpkCell);
 
                 tableBody.appendChild(row);
             });
