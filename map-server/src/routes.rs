@@ -41,11 +41,10 @@ pub async fn is_reachable(
     // Reuse the addresses the last crawl saw, rather than dialling blind.
     let snapshot = state.cache.snapshot();
     let addrs = snapshot
-        .model_reports
+        .peers
         .iter()
-        .flat_map(|m| &m.server_rows)
-        .find(|row| row.peer_id == peer_id)
-        .map(|row| row.peer_ip_info.multiaddrs.clone())
+        .find(|p| p.peer_id == peer_id)
+        .map(|p| p.peer_ip_info.multiaddrs.clone())
         .unwrap_or_default();
 
     Json(state.reachability.check(&peer_id, &addrs).await)

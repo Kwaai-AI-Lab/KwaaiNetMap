@@ -181,6 +181,47 @@ pub struct ReachabilityIssue {
     pub err: String,
 }
 
+/// A block range as a row carries it: half-open, the node's own declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockSpan {
+    pub start: i64,
+    pub end: i64,
+}
+
+/// One peer of the network, whatever it serves.
+///
+/// The page draws its rows from this list. A peer is here because the
+/// observer identified it speaking `/kwaai/kad` this pass, or because a kwaai
+/// DHT record names it — a node is a peer for being up, not for serving
+/// blocks. `model_reports` stays the per-model view the node health monitors
+/// and `kwaai-cli` read; nothing there changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerRow {
+    pub peer_id: String,
+    pub short_peer_id: String,
+    pub public_name: Option<String>,
+    /// What the node announces (`kwaai-0.7.0`), else identify's agent string
+    /// (`kwaainet/0.7.0`) for a peer that announced nothing.
+    pub version: Option<String>,
+    /// The announced `state` (`online`, `joining`, `offline`); `unannounced`
+    /// for a peer reached over kad that holds no record in the DHT — up, but
+    /// either not announcing or failing to.
+    pub state: String,
+    pub shard_loading: bool,
+    /// The model of its block record, if it has one, and that record's range.
+    pub model: Option<String>,
+    pub span: Option<BlockSpan>,
+    pub throughput: f64,
+    pub using_relay: Option<bool>,
+    pub vpk: Option<serde_json::Value>,
+    pub trust_attestations: usize,
+    pub peer_ip_info: PeerIpInfo,
+    /// Identified over a live connection speaking `/kwaai/kad` this pass.
+    pub kad: bool,
+    /// Named by at least one kwaai DHT record this pass.
+    pub announced: bool,
+}
+
 /// The whole `/api/v1/state` document, and the cache's unit of replacement.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -208,6 +249,10 @@ pub struct Snapshot {
     /// How many consecutive empty crawls have been held off.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub crawls_held: u32,
+    /// Every peer, serving or not — see [`PeerRow`]. Additive: absent from
+    /// v1's document, ignored by its readers.
+    #[serde(default)]
+    pub peers: Vec<PeerRow>,
 }
 
 impl Default for Snapshot {
@@ -224,6 +269,7 @@ impl Default for Snapshot {
             update_duration: 0.0,
             stale_since: None,
             crawls_held: 0,
+            peers: Vec::new(),
         }
     }
 }

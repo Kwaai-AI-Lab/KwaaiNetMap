@@ -515,6 +515,11 @@
             font-weight: bold;
         }
 
+        .status-unannounced {
+            color: #c0392b;
+            font-weight: bold;
+        }
+
         /* Role column (VPK) */
         .role-set {
             color: #2e6fb4;
@@ -951,8 +956,9 @@
         function nameAndVersion(server) {
             const info = (server.span && server.span.server_info) || {};
             const name = (info.public_name || "").replace(/\/v\d[\w.+-]*$/, "");
-            // The DHT field reads `kwaai-0.6.8`; the table wants the number.
-            const version = (info.version || "").replace(/^[^-]*-/, "");
+            // The DHT field reads `kwaai-0.6.8`, identify's agent `kwaainet/0.7.0`;
+            // the table wants the number.
+            const version = (info.version || "").replace(/^[^-\/]*[-\/]/, "");
             return { name: name || "N/A", version: version || "N/A" };
         }
 
@@ -1010,7 +1016,9 @@
         // state when its own probe of an ONLINE server fails. Departed is v2-only
         // for the same kind of reason — hivemind drops a record carrying the -1
         // tombstone rather than decoding it, so v1 never sees one.
-        const STATUS_LABELS = { online: 'Sharding', joining: 'Idle', offline: 'Departed', unreachable: 'Unreachable' };
+        // `unannounced`: reached over kad, but no record of it in the DHT —
+        // up, and either not announcing or failing to.
+        const STATUS_LABELS = { online: 'Sharding', joining: 'Idle', offline: 'Departed', unreachable: 'Unreachable', unannounced: 'Unannounced' };
         const statusLabel = (state) => STATUS_LABELS[state] || 'Unknown';
         const statusClass = (state) => `status-${STATUS_LABELS[state] ? state : 'unknown'}`;
 
@@ -1020,7 +1028,7 @@
         // The range rides on the label only where it means something: the
         // blocks a Serving node answers for, or a Loading node is fetching.
         // Idle and Departed nodes still announce one, but it promises nothing.
-        const blockRange = (server) => server.span ? `[${server.span.start}:${server.span.end}]` : '';
+        const blockRange = (server) => server.span && server.span.start != null ? `[${server.span.start}:${server.span.end}]` : '';
         const serverStatus = (server) => {
             const info = (server.span && server.span.server_info) || {};
             if (server.state === 'online') return `Serving ${blockRange(server)}`;
@@ -1043,6 +1051,43 @@
             ? `<span class="role-set">${label}</span>`
             : '<span class="role-none">—</span>';
 
+        // Every view draws from `peers`: each peer the observer identified
+        // over kad or found named in the DHT, serving or not — shaped like the
+        // v1 server rows the helpers above read. A map-server without `peers`
+        // falls back to flattening model_reports, so the older API still renders.
+        const NO_MODEL = 'No model';
+        function peerRows(data) {
+            if (Array.isArray(data.peers)) {
+                return data.peers.map(p => ({
+                    model: p.model || null,
+                    server: {
+                        peer_id: p.peer_id,
+                        state: p.state,
+                        kad: p.kad,
+                        announced: p.announced,
+                        peer_ip_info: p.peer_ip_info || {},
+                        span: {
+                            start: p.span ? p.span.start : null,
+                            end: p.span ? p.span.end : null,
+                            server_info: {
+                                public_name: p.public_name,
+                                version: p.version,
+                                throughput: p.throughput,
+                                using_relay: p.using_relay,
+                                vpk: p.vpk,
+                                shard_loading: p.shard_loading,
+                                trust_attestations: p.trust_attestations,
+                            },
+                        },
+                    },
+                }));
+            }
+            const rows = [];
+            (data.model_reports || []).forEach(report =>
+                report.server_rows.forEach(server => rows.push({ model: report.name, server })));
+            return rows;
+        }
+
         // Map View Logic
         //
         // Equal Earth (Šavrič, Patterson & Jenny 2018), the equal-area
@@ -1061,7 +1106,7 @@
         const MAP_CENTRAL_MERIDIAN = -30;
         const MAP_HOME = { lon: -40, lat: 38, zoom: 1.85 };
 
-        const STATUS_COLORS = { online: '#2e8b57', joining: '#e8891d', unreachable: '#d0342c', offline: '#8a8a8a' };
+        const STATUS_COLORS = { online: '#2e8b57', joining: '#e8891d', unreachable: '#d0342c', unannounced: '#c0392b', offline: '#8a8a8a' };
         // A site's colour is its most alarming node's.
         const STATUS_PRIORITY = ['unreachable', 'joining', 'online', 'offline'];
 
@@ -1158,7 +1203,7 @@
             map.home = map.zoom.constrain()(centred, viewport, sphere);
             // Applying a transform runs the zoom handler, which reads `map`.
             svg.call(map.zoom.transform, map.home);
-            if (currentData && currentData.model_reports) updateMapView(currentData);
+            if (currentData && (currentData.peers || currentData.model_reports)) updateMapView(currentData);
         }
 
         function closePopup() {
@@ -1273,23 +1318,22 @@
         function collectSites(data) {
             const located = new Map();
             const unknown = { label: 'Location unknown', nodes: [] };
-            data.model_reports.forEach(report => {
-                report.server_rows.forEach(server => {
-                    const location = server.peer_ip_info && server.peer_ip_info.location;
-                    if (!(location && location.status === "success")) {
-                        unknown.nodes.push({ server, report });
-                        return;
-                    }
-                    const key = `${location.lat},${location.lon}`;
-                    if (!located.has(key)) {
-                        located.set(key, {
-                            lat: location.lat, lon: location.lon,
-                            label: `${location.city}, ${location.country}`,
-                            nodes: [],
-                        });
-                    }
-                    located.get(key).nodes.push({ server, report });
-                });
+            peerRows(data).forEach(({ server, model }) => {
+                const report = { name: model || NO_MODEL };
+                const location = server.peer_ip_info && server.peer_ip_info.location;
+                if (!(location && location.status === "success")) {
+                    unknown.nodes.push({ server, report });
+                    return;
+                }
+                const key = `${location.lat},${location.lon}`;
+                if (!located.has(key)) {
+                    located.set(key, {
+                        lat: location.lat, lon: location.lon,
+                        label: `${location.city}, ${location.country}`,
+                        nodes: [],
+                    });
+                }
+                located.get(key).nodes.push({ server, report });
             });
             return { sites: [...located.values()], unknown };
         }
@@ -1645,8 +1689,17 @@
                 }
             ]);
             
-            // Extract unique model names
-            const modelNames = [...new Set(data.model_reports.map(report => report.name))];
+            // One group per model; peers serving none sit under NO_MODEL,
+            // which gets no API or model node — they hang off the bootstraps.
+            const rows = peerRows(data);
+            const rowsByModel = new Map();
+            rows.forEach(({ server, model }) => {
+                const name = model || NO_MODEL;
+                if (!rowsByModel.has(name)) rowsByModel.set(name, []);
+                rowsByModel.get(name).push(server);
+            });
+            const modelNames = [...rowsByModel.keys()].filter(name => name !== NO_MODEL);
+            modelColors[NO_MODEL] = '#8a8a8a';
             
             // Add tier 2: API servers for each model
             const apiNodes = [];
@@ -1743,11 +1796,10 @@
             });
             
             // Now add server nodes
-            data.model_reports.forEach(report => {
-                const modelName = report.name;
+            rowsByModel.forEach((servers, modelName) => {
                 const modelNodeId = `model-${modelName}`;
                 
-                report.server_rows.forEach((server, serverIndex) => {
+                servers.forEach((server, serverIndex) => {
                     // Create a unique ID for this server
                     const serverId = `${modelName}-server-${serverIndex}`;
                     
@@ -1792,12 +1844,14 @@
                     });
                     
                     // Connect server node to its model group node
-                    edges.add({
-                        from: modelNodeId,
-                        to: serverId,
-                        length: 100,
-                        arrows: 'to'
-                    });
+                    if (modelName !== NO_MODEL) {
+                        edges.add({
+                            from: modelNodeId,
+                            to: serverId,
+                            length: 100,
+                            arrows: 'to'
+                        });
+                    }
                     
                     // Connect server node directly to bootstrap nodes with dotted lines
                     edges.add([
@@ -1919,8 +1973,8 @@
             // Flatten data for tabular presentation
             tableData = [];
             
-            data.model_reports.forEach(report => {
-                report.server_rows.forEach(server => {
+            peerRows(data).forEach(({ server, model }) => {
+                {
                     const location = server.peer_ip_info.location;
                     const locationInfo = location && location.status === "success" ? 
                         `${location.city}, ${location.country}` : "Location Unknown";
@@ -1930,7 +1984,7 @@
                     const connectionType = getConnectionType(server);
                     
                     tableData.push({
-                        model: report.name,
+                        model: model || NO_MODEL,
                         location: locationInfo,
                         publicName: publicName,
                         version: version,
@@ -1944,7 +1998,7 @@
                         vpk: vpkRole(server),
                         connectionType: connectionType
                     });
-                });
+                }
             });
             
             // Update the view
