@@ -615,6 +615,7 @@
                             <th data-sort="peerId">Peer ID <span class="sort-indicator"></span></th>
                             <th data-sort="version">Version <span class="sort-indicator"></span></th>
                             <th data-sort="connectionType">Connection <span class="sort-indicator"></span></th>
+                            <th data-sort="model">Model <span class="sort-indicator"></span></th>
                             <th data-sort="state">Sharding <span class="sort-indicator"></span></th>
                             <th data-sort="vpk">VPK <span class="sort-indicator"></span></th>
                             <th data-sort="throughput">Tok/sec <span class="sort-indicator"></span></th>
@@ -1493,7 +1494,7 @@
             if (pageData.length === 0) {
                 const row = document.createElement('tr');
                 const cell = document.createElement('td');
-                cell.colSpan = 8;
+                cell.colSpan = 9;
                 cell.textContent = 'No data found';
                 cell.style.textAlign = 'center';
                 row.appendChild(cell);
@@ -1591,6 +1592,11 @@
                 const connectionTypeCell = document.createElement('td');
                 connectionTypeCell.innerHTML = getConnectionTypeHtml(rowData.connectionType);
                 row.appendChild(connectionTypeCell);
+
+                // Model
+                const modelCell = document.createElement('td');
+                modelCell.textContent = rowData.model;
+                row.appendChild(modelCell);
 
                 // Status
                 const stateCell = document.createElement('td');
