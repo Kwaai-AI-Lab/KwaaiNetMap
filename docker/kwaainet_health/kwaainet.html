@@ -322,26 +322,15 @@
             background-color: #e9e9e9;
         }
 
-        /* Make the peer-ID cell a positioning context so the copy button
-           can sit absolutely inside it without affecting row height.
-           The extra right-padding reserves space for the absolute button
-           so the cell's auto width includes it and the ID text never
-           overlaps with the icon. */
-        .data-table td.peer-id-cell {
-            position: relative;
-            padding-right: 24px;
-        }
         .peer-id-copy {
-            /* The button is positioned absolutely so it doesn't influence
-               the row's line-box height. Without this, FA's icon glyph
-               metrics (or even just the <button>'s default inline-block
-               line box) push the row ~9px taller than data-only rows.
-               We pin it to the right of the cell padding-end and centre
-               it vertically. */
-            position: absolute;
-            top: 50%;
-            right: 12px;
-            transform: translateY(-50%);
+            /* Flows inline right after the ID rather than pinned to the
+               cell's far edge, where a wide column left it stranded. As a
+               plain inline with line-height 1 it adds nothing to the row's
+               line box; a <button>'s default inline-block would push the
+               row ~9px taller than data-only rows. */
+            display: inline;
+            margin-left: 0.4em;
+            vertical-align: baseline;
             /* Milligram (loaded earlier in this file) styles every <button>
                with a 3.8rem-tall purple pill. We undo all of that
                explicitly: height, padding, border-radius, text-transform,
