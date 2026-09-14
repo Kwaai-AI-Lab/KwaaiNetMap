@@ -436,12 +436,14 @@
             font-size: 14px;
             flex: 1;
             max-width: 300px;
-            margin-right: 10px;
+            /* Milligram gives inputs and labels a bottom margin; centred
+               flex items centre their margin boxes, so the label sat low. */
+            margin: 0 10px 0 0;
         }
         
         .table-controls label {
             font-weight: bold;
-            margin-right: 10px;
+            margin: 0 10px 0 0;
         }
         
         /* Pagination */
