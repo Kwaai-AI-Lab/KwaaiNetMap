@@ -329,7 +329,9 @@
                line box; a <button>'s default inline-block would push the
                row ~9px taller than data-only rows. */
             display: inline;
-            margin-left: 0.4em;
+            /* Milligram's 10px bottom margin on <button> is the one thing
+               that does grow the row, so the shorthand sets all four. */
+            margin: 0 0 0 0.4em;
             vertical-align: baseline;
             /* Milligram (loaded earlier in this file) styles every <button>
                with a 3.8rem-tall purple pill. We undo all of that
