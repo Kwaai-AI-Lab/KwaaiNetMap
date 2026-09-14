@@ -7,10 +7,11 @@
 # this manifest until the patched source exists.
 [patch.crates-io]
 multistream-select = { path = "patches/multistream-select" }
+libp2p-kad = { path = "patches/libp2p-kad" }
 
 [package]
 name = "map-server"
-version = "0.6.2"
+version = "0.7.0"
 edition = "2021"
 authors = ["Kwaai AI Lab <dev@kwaai.ai>"]
 license = "MIT"
@@ -22,15 +23,18 @@ publish = false
 name = "map-server"
 path = "src/main.rs"
 
-# From crates.io rather than the KwaaiNet workspace; bump the pair together.
+# Bump the pair together. Normally from crates.io; the git tag is a bridge
+# for 0.7.0, whose kwaai-p2p never published (its publish check failed on a
+# call into the patched libp2p-kad — see patches/README.md). Back to a
+# crates.io version at the first 0.7.x that carries KwaaiNet#216.
 #
 # `kwaai-p2p` is rust-libp2p: the swarm runs in this process. Deliberately NOT
 # `kwaai-p2p-daemon` — that crate wraps the standalone Go libp2p daemon, which
 # KwaaiNet has replaced, and its build script needs a Go toolchain to compile
 # the Go binary. Nothing here speaks the p2pd control protocol.
 [dependencies]
-kwaai-hivemind-dht = "0.6.8"
-kwaai-p2p = "0.6.8"
+kwaai-hivemind-dht = { git = "https://github.com/Kwaai-AI-Lab/KwaaiNet", tag = "v0.7.0" }
+kwaai-p2p = { git = "https://github.com/Kwaai-AI-Lab/KwaaiNet", tag = "v0.7.0" }
 
 # Web framework
 axum = { version = "0.7", features = ["macros", "ws"] }
