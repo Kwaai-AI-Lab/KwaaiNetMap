@@ -17,7 +17,7 @@ use anyhow::Result;
 use chrono::Utc;
 use kwaai_hivemind_dht::protocol::{FindRequest, FindResponse, NodeInfo, RequestAuthInfo};
 use kwaai_hivemind_dht::PROTOCOL_FIND;
-use kwaai_p2p::{NetworkHandle, PeerId};
+use kwaai_p2p::{Direction, NetworkHandle, PeerId};
 use prost::Message as _;
 use sha1::{Digest, Sha1};
 use tracing::{debug, info, warn};
@@ -26,8 +26,8 @@ use crate::cache::{NodeCache, NodeEntry};
 use crate::dht::{decode_model_registry, decode_server_info, dht_key, dictionary_entries};
 use crate::geoip::{public_ips, relay_dns_names, relay_peer_id_of, via_relay_at, GeoIp};
 use crate::snapshot::{
-    short_peer_id, Contributor, Location, ModelReport, PeerIpInfo, PeerSpan, ReachabilityIssue,
-    ServerInfo, ServerRow, Snapshot,
+    short_peer_id, BlockSpan, Contributor, Location, ModelReport, PeerIpInfo, PeerRow, PeerSpan,
+    ReachabilityIssue, ServerInfo, ServerRow, Snapshot,
 };
 
 /// The `_petals.models` registry names the models actually on the network.
@@ -56,6 +56,12 @@ const BOOTSTRAP_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Records for nodes that announce a capability rather than a block range.
 const CAPABILITY_KEYS: &[&str] = &["_kwaai.vpk.nodes", "_kwaai.inference.nodes"];
+
+/// A peer that speaks any version of KwaaiNet's kad name is a KwaaiNet node,
+/// whatever it announces. kubo and the 0.6.x line speak `/ipfs/kad/1.0.0`
+/// alone, so the legacy name proves nothing; 0.6.x nodes still reach the
+/// list through their records.
+const KWAAI_KAD_PREFIX: &str = "/kwaai/kad/";
 
 /// What one peer publishes for one model, folded across that model's blocks.
 struct PeerModelEntry {
@@ -165,15 +171,36 @@ async fn crawl_once(
         collect_capability(handle, &our_dhtid, &mut set, key, &mut capability_peers).await;
     }
 
+    // A node is a peer for being up, not for announcing: whoever kad knows —
+    // the routing table, plus whoever is connected — is dialed alongside the
+    // record peers, so identify can confirm the kad name on each.
+    let exclude = excluded_peers(handle, bootstrap_peers);
+    let kad_known: BTreeSet<String> = match handle.network_snapshot().await {
+        Ok(snap) => snap
+            .routing
+            .iter()
+            .map(|e| e.peer_id.to_base58())
+            .chain(snap.peers.iter().map(|p| p.peer_id.to_base58()))
+            .collect(),
+        Err(e) => {
+            warn!("network_snapshot failed: {e}");
+            BTreeSet::new()
+        }
+    };
     let discovered: BTreeSet<String> = per_model
         .values()
         .flat_map(|peers| peers.keys().cloned())
         .chain(capability_peers.keys().cloned())
+        .chain(kad_known)
+        .filter(|id| !exclude.contains(id))
         .collect();
     let dial_errors = connect_discovered_peers(handle, &discovered).await;
 
     let addrs = observed_addrs(handle).await;
-    let flat: Vec<String> = addrs.values().flatten().cloned().collect();
+    let flat: Vec<String> = addrs
+        .values()
+        .flat_map(|o| o.addrs.iter().cloned())
+        .collect();
     let mut ips = public_ips(&flat);
     ips.extend(geo.resolve_relays(&relay_dns_names(&flat)).await);
     geo.warm(&ips).await;
@@ -185,6 +212,7 @@ async fn crawl_once(
         capability_peers,
         &addrs,
         &dial_errors,
+        &exclude,
         geo,
     );
     snapshot.update_period = CRAWL_INTERVAL.as_secs();
@@ -533,14 +561,62 @@ async fn connect_discovered_peers(
         .await
 }
 
-/// Addresses of every peer the observer currently holds a connection to.
+/// One connection the observer holds, reduced to what classification needs.
+#[derive(Debug, Clone)]
+struct Conn {
+    addr: String,
+    direction: Direction,
+    /// Our circuit listener, for an inbound connection that arrived relayed.
+    via: Option<String>,
+    dcutr: bool,
+}
+
+/// How the observer reaches a peer, in the order the evidence is trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reachability {
+    /// We dialed a plain address and it answered.
+    Direct,
+    /// Direct now, but only because DCUtR punched through the peer's NAT.
+    Punched,
+    /// Only through a relay circuit.
+    Relayed,
+    /// The peer dialed us and we hold nothing else. Its address is the source
+    /// of *its* dial — a NAT's ephemeral mapping as often as not — so it says
+    /// where the peer is, not that anyone can dial it.
+    Inbound,
+}
+
+impl Reachability {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Punched => "punched",
+            Self::Relayed => "relayed",
+            Self::Inbound => "inbound",
+        }
+    }
+}
+
+/// What the crawl observed about one peer.
+#[derive(Debug, Clone)]
+struct Observed {
+    /// The addresses that justify `reachability`, and only those.
+    addrs: Vec<String>,
+    reachability: Reachability,
+    /// Identify's agent string, e.g. `kwaainet/0.7.0`.
+    agent_version: Option<String>,
+    /// Identify listed a `/kwaai/kad/` protocol — a KwaaiNet node for certain.
+    kwaai_kad: bool,
+}
+
+/// Every peer the observer currently holds a connection to, classified.
 ///
 /// This is the only source of peer addresses: DHT records carry peer ids, never
 /// addresses — which is why the crawl dials every discovered peer first.
 ///
 /// `list_peers` reports one entry per *connection*, so a peer reached more than
-/// one way appears more than once; the addresses are grouped back per peer.
-async fn observed_addrs(handle: &NetworkHandle) -> HashMap<String, Vec<String>> {
+/// one way appears more than once; the connections are grouped back per peer.
+async fn observed_addrs(handle: &NetworkHandle) -> HashMap<String, Observed> {
     let peers = match handle.list_peers().await {
         Ok(p) => p,
         Err(e) => {
@@ -549,13 +625,112 @@ async fn observed_addrs(handle: &NetworkHandle) -> HashMap<String, Vec<String>> 
         }
     };
 
-    let mut out: HashMap<String, Vec<String>> = HashMap::new();
-    for peer in peers {
-        out.entry(peer.peer_id.to_base58())
-            .or_default()
-            .push(peer.addr.to_string());
+    #[derive(Default)]
+    struct Seen {
+        conns: Vec<Conn>,
+        agent_version: Option<String>,
+        kwaai_kad: bool,
     }
-    out
+    let mut seen: HashMap<String, Seen> = HashMap::new();
+    for peer in peers {
+        let entry = seen.entry(peer.peer_id.to_base58()).or_default();
+        if entry.agent_version.is_none() {
+            entry.agent_version = peer.agent_version.clone();
+        }
+        entry.kwaai_kad |= peer
+            .protocols
+            .iter()
+            .any(|p| p.starts_with(KWAAI_KAD_PREFIX));
+        entry.conns.push(Conn {
+            addr: peer.addr.to_string(),
+            direction: peer.direction,
+            via: peer.via.map(|m| m.to_string()),
+            dcutr: peer.dcutr,
+        });
+    }
+    seen.into_iter()
+        .map(|(id, s)| {
+            let mut observed = classify(&id, &s.conns);
+            observed.agent_version = s.agent_version;
+            observed.kwaai_kad = s.kwaai_kad;
+            (id, observed)
+        })
+        .collect()
+}
+
+/// The observer itself and the bootstraps: kad knows both, neither is a node
+/// of the network. Bootstraps are reported by the dots, not as rows.
+fn excluded_peers(handle: &NetworkHandle, bootstrap_peers: &[String]) -> BTreeSet<String> {
+    std::iter::once(handle.local_peer_id())
+        .chain(bootstrap_peers.iter().filter_map(|a| trailing_peer_id(a)))
+        .collect()
+}
+
+/// The `/p2p/<id>` a bootstrap address ends in, if it has one.
+fn trailing_peer_id(addr: &str) -> Option<String> {
+    let (_, id) = addr.rsplit_once("/p2p/")?;
+    (!id.is_empty() && !id.contains('/')).then(|| id.to_string())
+}
+
+/// Reduce a peer's connections to one verdict. The observer listens on a
+/// public port, so NATed peers dial *it*; before this, the source address of
+/// such an inbound connection was reported like an address we had dialed, and
+/// a relay-only node behind symmetric NAT read as directly reachable whenever
+/// it happened to have dialed in before the crawl.
+fn classify(peer_id: &str, conns: &[Conn]) -> Observed {
+    let is_circuit = |c: &Conn| c.addr.contains("/p2p-circuit") || c.via.is_some();
+    let outbound = |c: &Conn| c.direction == Direction::Outbound;
+
+    if conns.iter().any(|c| c.dcutr) {
+        return Observed {
+            addrs: conns
+                .iter()
+                .filter(|c| c.dcutr)
+                .map(|c| c.addr.clone())
+                .collect(),
+            reachability: Reachability::Punched,
+            agent_version: None,
+            kwaai_kad: false,
+        };
+    }
+    let direct: Vec<String> = conns
+        .iter()
+        .filter(|c| outbound(c) && !is_circuit(c))
+        .map(|c| c.addr.clone())
+        .collect();
+    if !direct.is_empty() {
+        return Observed {
+            addrs: direct,
+            reachability: Reachability::Direct,
+            agent_version: None,
+            kwaai_kad: false,
+        };
+    }
+    let relayed: Vec<String> = conns
+        .iter()
+        .filter(|c| is_circuit(c))
+        .map(|c| match &c.via {
+            // An inbound relayed connection's own addr is a bare /p2p/<peer>;
+            // the circuit is on our listener side. Rebuild the full form so
+            // geoip and the page read it like an outbound circuit.
+            Some(via) => format!("{via}/p2p/{peer_id}"),
+            None => c.addr.clone(),
+        })
+        .collect();
+    if !relayed.is_empty() {
+        return Observed {
+            addrs: relayed,
+            reachability: Reachability::Relayed,
+            agent_version: None,
+            kwaai_kad: false,
+        };
+    }
+    Observed {
+        addrs: conns.iter().map(|c| c.addr.clone()).collect(),
+        reachability: Reachability::Inbound,
+        agent_version: None,
+        kwaai_kad: false,
+    }
 }
 
 // ── Snapshot assembly ─────────────────────────────────────────────────────────
@@ -580,17 +755,44 @@ fn locate_row(geo: &GeoIp, peer_addrs: &[String], known: &HashMap<String, Locati
         .unwrap_or(loc)
 }
 
+/// Where a row is placed and how it was reached. A node that says it needs a
+/// relay, seen only because it dialed us: its egress address is real, but it
+/// asked not to be placed by it. Keep it a relayed peer of unknown place.
+fn peer_ip_info_for(
+    observed: Option<&Observed>,
+    using_relay: Option<bool>,
+    geo: &GeoIp,
+    known: &HashMap<String, Location>,
+) -> PeerIpInfo {
+    match observed {
+        Some(o) if o.reachability == Reachability::Inbound && using_relay == Some(true) => {
+            PeerIpInfo {
+                location: Location::via_relay(),
+                multiaddrs: Vec::new(),
+                reachability: Some(Reachability::Relayed.as_str().into()),
+            }
+        }
+        Some(o) => PeerIpInfo {
+            location: locate_row(geo, &o.addrs, known),
+            multiaddrs: o.addrs.clone(),
+            reachability: Some(o.reachability.as_str().into()),
+        },
+        None => PeerIpInfo::default(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_snapshot(
     bootstrap_states: Vec<String>,
     models: &[Model],
     per_model: BTreeMap<String, HashMap<String, PeerModelEntry>>,
     capability_peers: HashMap<String, ServerInfo>,
-    addrs: &HashMap<String, Vec<String>>,
+    addrs: &HashMap<String, Observed>,
     dial_errors: &BTreeMap<String, String>,
+    exclude: &BTreeSet<String>,
     geo: &GeoIp,
 ) -> Snapshot {
     let mut model_reports = Vec::new();
-    let mut all_peers: BTreeSet<String> = BTreeSet::new();
     let mut blocks_covered = 0usize;
     // Keyed by peer so a server carrying several models is reported once.
     let mut issues: BTreeMap<String, String> = BTreeMap::new();
@@ -599,7 +801,7 @@ fn build_snapshot(
     // relayed through another *node* can borrow its relay's pin.
     let known: HashMap<String, Location> = addrs
         .iter()
-        .map(|(id, a)| (id.clone(), geo.locate(a)))
+        .map(|(id, o)| (id.clone(), geo.locate(&o.addrs)))
         .collect();
 
     for model in models {
@@ -613,7 +815,6 @@ fn build_snapshot(
         let mut covered: BTreeSet<i64> = BTreeSet::new();
         let mut server_rows = Vec::new();
         for (peer_id, entry) in peers {
-            all_peers.insert(peer_id.clone());
             // v1 probes only the servers claiming to serve, and reports the
             // ones that would not answer. A peer that never claimed to serve
             // is not an issue, and a state that is merely not ONLINE is not a
@@ -625,16 +826,14 @@ fn build_snapshot(
                 }
             }
 
-            let peer_addrs = addrs.get(peer_id).cloned().unwrap_or_default();
+            let peer_ip_info =
+                peer_ip_info_for(addrs.get(peer_id), entry.info.using_relay, geo, &known);
             server_rows.push(ServerRow {
                 short_peer_id: short_peer_id(peer_id),
                 peer_id: peer_id.clone(),
                 show_public_name: entry.info.public_name.is_some(),
                 state: entry.info.state.clone(),
-                peer_ip_info: PeerIpInfo {
-                    location: locate_row(geo, &peer_addrs, &known),
-                    multiaddrs: peer_addrs,
-                },
+                peer_ip_info,
                 span: PeerSpan {
                     peer_id: peer_id.clone(),
                     // The node's own declared range, verbatim, which is what v1
@@ -675,7 +874,71 @@ fn build_snapshot(
 
     // Most servers first — the page has no sort of its own on this list.
     model_reports.sort_by_key(|m| std::cmp::Reverse(m.server_rows.len()));
-    all_peers.extend(capability_peers.keys().cloned());
+
+    // ── Every peer ───────────────────────────────────────────────────────
+    // Its block record if it has one (the online one, if several models), else
+    // its registry record, else nothing but the connection kad gave us.
+    let mut block_of: HashMap<&str, (&Model, &PeerModelEntry)> = HashMap::new();
+    for model in models {
+        for (id, entry) in per_model.get(&model.dht_prefix).into_iter().flatten() {
+            block_of
+                .entry(id)
+                .and_modify(|cur| {
+                    if cur.1.info.state != "online" && entry.info.state == "online" {
+                        *cur = (model, entry);
+                    }
+                })
+                .or_insert((model, entry));
+        }
+    }
+    let ids: BTreeSet<&str> = block_of
+        .keys()
+        .copied()
+        .chain(capability_peers.keys().map(String::as_str))
+        .chain(
+            addrs
+                .iter()
+                .filter(|(_, o)| o.kwaai_kad)
+                .map(|(id, _)| id.as_str()),
+        )
+        .filter(|id| !exclude.contains(*id))
+        .collect();
+    let peers: Vec<PeerRow> = ids
+        .into_iter()
+        .map(|id| {
+            let block = block_of.get(id).copied();
+            let info = block
+                .map(|(_, e)| &e.info)
+                .or_else(|| capability_peers.get(id));
+            let observed = addrs.get(id);
+            let using_relay = info.and_then(|i| i.using_relay);
+            PeerRow {
+                peer_id: id.to_string(),
+                short_peer_id: short_peer_id(id),
+                public_name: info.and_then(|i| i.public_name.clone()),
+                version: info
+                    .and_then(|i| i.version.clone())
+                    .or_else(|| observed.and_then(|o| o.agent_version.clone())),
+                state: info.map_or_else(|| "unannounced".to_string(), |i| i.state.clone()),
+                shard_loading: info.and_then(|i| i.shard_loading).unwrap_or(false),
+                model: block.map(|(m, _)| {
+                    let name = model_name(&m.repository, &m.dht_prefix);
+                    name.rsplit('/').next().unwrap_or(&name).to_string()
+                }),
+                span: block.map(|(_, e)| BlockSpan {
+                    start: e.info.start_block,
+                    end: e.info.end_block,
+                }),
+                throughput: info.map_or(0.0, |i| i.throughput),
+                using_relay,
+                vpk: info.and_then(|i| i.vpk.clone()),
+                trust_attestations: info.map_or(0, |i| i.trust_attestations),
+                peer_ip_info: peer_ip_info_for(observed, using_relay, geo, &known),
+                kad: observed.is_some_and(|o| o.kwaai_kad),
+                announced: info.is_some(),
+            }
+        })
+        .collect();
 
     Snapshot {
         top_contributors: top_contributors(&model_reports),
@@ -683,13 +946,14 @@ fn build_snapshot(
         update_period: 0,
         update_duration: 0.0,
         bootstrap_states,
-        num_peers: all_peers.len(),
+        num_peers: peers.len(),
         num_blocks_covered: blocks_covered,
         model_reports,
         reachability_issues: issues
             .into_iter()
             .map(|(peer_id, err)| ReachabilityIssue { peer_id, err })
             .collect(),
+        peers,
         last_updated: Utc::now(),
         // A crawl that produced a snapshot is fresh by construction; the hold
         // logic sets these if it ends up being held instead.
@@ -762,34 +1026,24 @@ pub fn merge_crawl(served: &Snapshot, fresh: Snapshot) -> Snapshot {
     }
 }
 
-/// The flat per-peer view `/api/nodes` and `/api/stats` are built from.
+/// The flat per-peer view `/api/nodes` and `/api/stats` are built from — one
+/// entry per peer, serving or not.
 pub fn node_entries(snapshot: &Snapshot) -> Vec<NodeEntry> {
-    let mut best: HashMap<String, NodeEntry> = HashMap::new();
-    for report in &snapshot.model_reports {
-        for row in &report.server_rows {
-            let info = &row.span.server_info;
-            let entry = NodeEntry {
-                peer_id: row.peer_id.clone(),
-                trust_tier: tier_from_vc_count(info.trust_attestations).to_string(),
-                start_block: row.span.start.max(0) as usize,
-                end_block: row.span.end.max(0) as usize,
-                throughput: info.throughput,
-                public_name: info.public_name.clone().unwrap_or_default(),
-                version: info.version.clone().unwrap_or_default(),
-                vpk: info.vpk.is_some(),
-                last_seen: snapshot.last_updated,
-            };
-            // A peer serving several models appears once, under its best one.
-            best.entry(row.peer_id.clone())
-                .and_modify(|e| {
-                    if entry.throughput > e.throughput {
-                        *e = entry.clone();
-                    }
-                })
-                .or_insert(entry);
-        }
-    }
-    best.into_values().collect()
+    snapshot
+        .peers
+        .iter()
+        .map(|p| NodeEntry {
+            peer_id: p.peer_id.clone(),
+            trust_tier: tier_from_vc_count(p.trust_attestations).to_string(),
+            start_block: p.span.map_or(0, |s| s.start.max(0) as usize),
+            end_block: p.span.map_or(0, |s| s.end.max(0) as usize),
+            throughput: p.throughput,
+            public_name: p.public_name.clone().unwrap_or_default(),
+            version: p.version.clone().unwrap_or_default(),
+            vpk: p.vpk.is_some(),
+            last_seen: snapshot.last_updated,
+        })
+        .collect()
 }
 
 fn tier_from_vc_count(count: usize) -> &'static str {
@@ -804,6 +1058,90 @@ fn tier_from_vc_count(count: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn conn(addr: &str, direction: Direction, via: Option<&str>, dcutr: bool) -> Conn {
+        Conn {
+            addr: addr.into(),
+            direction,
+            via: via.map(str::to_string),
+            dcutr,
+        }
+    }
+
+    #[test]
+    fn an_inbound_only_plain_connection_is_not_a_dialable_address() {
+        // node-h on the bed: symmetric NAT, dialed the observer, random port.
+        let o = classify(
+            "12D3KooWPeer",
+            &[conn(
+                "/ip4/198.18.0.41/tcp/28456",
+                Direction::Inbound,
+                None,
+                false,
+            )],
+        );
+        assert_eq!(o.reachability, Reachability::Inbound);
+        assert_eq!(o.addrs, vec!["/ip4/198.18.0.41/tcp/28456"]);
+    }
+
+    #[test]
+    fn a_punched_connection_outranks_everything() {
+        let o = classify(
+            "12D3KooWPeer",
+            &[
+                conn(
+                    "/ip4/198.18.0.10/tcp/8000/p2p/QmRelay/p2p-circuit/p2p/12D3KooWPeer",
+                    Direction::Outbound,
+                    None,
+                    false,
+                ),
+                conn("/ip4/198.18.0.31/tcp/8080", Direction::Outbound, None, true),
+            ],
+        );
+        assert_eq!(o.reachability, Reachability::Punched);
+        assert_eq!(o.addrs, vec!["/ip4/198.18.0.31/tcp/8080"]);
+    }
+
+    #[test]
+    fn an_outbound_plain_dial_is_direct_even_beside_an_inbound_one() {
+        let o = classify(
+            "12D3KooWPeer",
+            &[
+                conn(
+                    "/ip4/93.184.216.34/tcp/54321",
+                    Direction::Inbound,
+                    None,
+                    false,
+                ),
+                conn(
+                    "/ip4/93.184.216.34/tcp/8080",
+                    Direction::Outbound,
+                    None,
+                    false,
+                ),
+            ],
+        );
+        assert_eq!(o.reachability, Reachability::Direct);
+        assert_eq!(o.addrs, vec!["/ip4/93.184.216.34/tcp/8080"]);
+    }
+
+    #[test]
+    fn an_inbound_relayed_connection_is_rebuilt_as_a_circuit_address() {
+        let o = classify(
+            "12D3KooWPeer",
+            &[conn(
+                "/p2p/12D3KooWPeer",
+                Direction::Inbound,
+                Some("/ip4/198.18.0.10/tcp/8000/p2p/QmRelay/p2p-circuit"),
+                false,
+            )],
+        );
+        assert_eq!(o.reachability, Reachability::Relayed);
+        assert_eq!(
+            o.addrs,
+            vec!["/ip4/198.18.0.10/tcp/8000/p2p/QmRelay/p2p-circuit/p2p/12D3KooWPeer"]
+        );
+    }
 
     #[test]
     fn a_peer_relayed_through_a_known_node_borrows_its_pin() {
@@ -896,12 +1234,155 @@ mod tests {
             HashMap::new(),
             &HashMap::new(),
             &BTreeMap::new(),
+            &BTreeSet::new(),
             &GeoIp::from_env(),
         );
 
         let span = &snapshot.model_reports[0].server_rows[0].span;
         assert_eq!((span.start, span.end), (0, 1));
         assert_eq!(snapshot.num_blocks_covered, 1);
+    }
+
+    fn seen(reachability: Reachability, kad: bool) -> Observed {
+        Observed {
+            addrs: vec!["/ip4/198.18.0.31/tcp/8080".into()],
+            reachability,
+            agent_version: Some("kwaainet/0.7.0".into()),
+            kwaai_kad: kad,
+        }
+    }
+
+    /// A node that is up but holds no record in the DHT — announcing nothing,
+    /// or failing to — is still a peer: it identified as one over kad.
+    #[test]
+    fn a_kad_peer_with_no_record_is_an_unannounced_row() {
+        let mut addrs = HashMap::new();
+        addrs.insert(
+            "12D3KooWKadOnly".to_string(),
+            seen(Reachability::Direct, true),
+        );
+        // Speaks only a foreign kad name: not ours, whatever it is.
+        addrs.insert(
+            "12D3KooWForeign".to_string(),
+            seen(Reachability::Direct, false),
+        );
+
+        let snapshot = build_snapshot(
+            vec!["online".into()],
+            &[],
+            BTreeMap::new(),
+            HashMap::new(),
+            &addrs,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &GeoIp::from_env(),
+        );
+
+        assert_eq!(snapshot.num_peers, 1);
+        let row = &snapshot.peers[0];
+        assert_eq!(row.peer_id, "12D3KooWKadOnly");
+        assert_eq!(row.state, "unannounced");
+        assert!(row.kad && !row.announced);
+        assert_eq!(row.version.as_deref(), Some("kwaainet/0.7.0"));
+        assert_eq!(row.peer_ip_info.reachability.as_deref(), Some("direct"));
+        assert!(row.span.is_none() && row.model.is_none());
+        assert!(snapshot.model_reports.is_empty(), "no record, no model row");
+    }
+
+    /// The observer and the bootstraps are kad peers too; neither is a node.
+    #[test]
+    fn the_observer_and_the_bootstraps_are_not_rows() {
+        let mut addrs = HashMap::new();
+        for id in ["12D3KooWSelf", "12D3KooWBoot", "12D3KooWNode"] {
+            addrs.insert(id.to_string(), seen(Reachability::Direct, true));
+        }
+        let exclude: BTreeSet<String> = ["12D3KooWSelf", "12D3KooWBoot"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let snapshot = build_snapshot(
+            vec![],
+            &[],
+            BTreeMap::new(),
+            HashMap::new(),
+            &addrs,
+            &BTreeMap::new(),
+            &exclude,
+            &GeoIp::from_env(),
+        );
+        let ids: Vec<&str> = snapshot.peers.iter().map(|p| p.peer_id.as_str()).collect();
+        assert_eq!(ids, ["12D3KooWNode"]);
+        assert_eq!(
+            trailing_peer_id("/dns4/bootstrap1/tcp/8000/p2p/12D3KooWBoot").as_deref(),
+            Some("12D3KooWBoot")
+        );
+        assert_eq!(trailing_peer_id("/dns4/bootstrap1/tcp/8000"), None);
+    }
+
+    /// A serving node is one row carrying its block record; a registry-only
+    /// node (JOINING, or whole-model) keeps its announced state and no span.
+    /// Both reach `/api/nodes`.
+    #[test]
+    fn record_peers_keep_their_announced_state() {
+        let model = Model {
+            dht_prefix: "M".into(),
+            repository: "https://huggingface.co/unsloth/Llama-3.1-8B-Instruct".into(),
+            num_blocks: 32,
+        };
+        let mut peers = HashMap::new();
+        peers.insert(
+            "12D3KooWServing".to_string(),
+            PeerModelEntry {
+                blocks: [0].into_iter().collect(),
+                info: ServerInfo {
+                    state: "online".into(),
+                    start_block: 0,
+                    end_block: 1,
+                    public_name: Some("node-a".into()),
+                    version: Some("kwaai-0.7.0".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        let mut registry = HashMap::new();
+        registry.insert(
+            "12D3KooWJoining".to_string(),
+            ServerInfo {
+                state: "joining".into(),
+                start_block: 0,
+                end_block: 8,
+                ..Default::default()
+            },
+        );
+        let snapshot = build_snapshot(
+            vec![],
+            &[model],
+            BTreeMap::from([("M".to_string(), peers)]),
+            registry,
+            &HashMap::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &GeoIp::from_env(),
+        );
+
+        assert_eq!(snapshot.num_peers, 2);
+        let by_id = |id: &str| snapshot.peers.iter().find(|p| p.peer_id == id).unwrap();
+        let serving = by_id("12D3KooWServing");
+        assert_eq!(serving.state, "online");
+        assert_eq!(serving.model.as_deref(), Some("Llama-3.1-8B-Instruct"));
+        assert_eq!(serving.span, Some(BlockSpan { start: 0, end: 1 }));
+        assert!(serving.announced && !serving.kad, "no connection this pass");
+        let joining = by_id("12D3KooWJoining");
+        assert_eq!(joining.state, "joining");
+        assert!(
+            joining.span.is_none(),
+            "a registry record is not a block record"
+        );
+
+        let entries = node_entries(&snapshot);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(snapshot.model_reports.len(), 1, "the v1 view is unchanged");
+        assert_eq!(snapshot.model_reports[0].server_rows.len(), 1);
     }
 
     #[test]
@@ -948,6 +1429,7 @@ mod tests {
             HashMap::new(),
             &HashMap::new(),
             &BTreeMap::new(),
+            &BTreeSet::new(),
             &GeoIp::from_env(),
         );
 
@@ -988,6 +1470,7 @@ mod tests {
             HashMap::new(),
             &HashMap::new(),
             &BTreeMap::new(),
+            &BTreeSet::new(),
             &GeoIp::from_env(),
         );
 
@@ -1038,6 +1521,7 @@ mod tests {
             HashMap::new(),
             &HashMap::new(),
             &BTreeMap::from([("QmDark".to_string(), "dial timed out after 15s".to_string())]),
+            &BTreeSet::new(),
             &GeoIp::from_env(),
         );
 

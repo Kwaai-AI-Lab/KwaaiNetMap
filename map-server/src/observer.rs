@@ -42,7 +42,7 @@ pub struct Observer {
 /// The identity is generated per process and never persisted: nothing dials
 /// the map, so a stable peer id would buy nothing and a key file would be one
 /// more thing to mount.
-pub async fn start(bootstrap_peers: &[String]) -> Result<Observer> {
+pub async fn start(bootstrap_peers: &[String], only_global_ips: bool) -> Result<Observer> {
     let keypair = identity::Keypair::generate_ed25519();
     let peer_id = keypair.public().to_peer_id();
 
@@ -52,6 +52,9 @@ pub async fn start(bootstrap_peers: &[String]) -> Result<Observer> {
         // anyone else. Together with never announcing, that is what makes it
         // an observer.
         dht_server: false,
+        // The published crate (0.6.8) still calls the field by its old name
+        // and defaults it lenient; set it explicitly so a public map is strict.
+        require_global_ips: only_global_ips,
         ..NetworkConfig::default()
     };
 

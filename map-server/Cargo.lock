@@ -1528,9 +1528,8 @@ dependencies = [
 
 [[package]]
 name = "kwaai-hivemind-dht"
-version = "0.6.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ea48b70e227982e0819787be52dd0d9c818415302183b4e4fb1f54fb3508262"
+version = "0.7.0"
+source = "git+https://github.com/Kwaai-AI-Lab/KwaaiNet?tag=v0.7.0#e66dd62273f367fbee4a18ad4cf4607bbc489926"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1551,9 +1550,8 @@ dependencies = [
 
 [[package]]
 name = "kwaai-p2p"
-version = "0.6.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e40d07cd58b5be4d1f4cdd1cdfb1194fe6b4af001ea9912e52f4bba50163b93f"
+version = "0.7.0"
+source = "git+https://github.com/Kwaai-AI-Lab/KwaaiNet?tag=v0.7.0#e66dd62273f367fbee4a18ad4cf4607bbc489926"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1779,8 +1777,6 @@ dependencies = [
 [[package]]
 name = "libp2p-kad"
 version = "0.48.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "13d3fd632a5872ec804d37e7413ceea20588f69d027a0fa3c46f82574f4dee60"
 dependencies = [
  "asynchronous-codec",
  "bytes",
@@ -2078,7 +2074,7 @@ checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
 name = "map-server"
-version = "0.6.2"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "axum",

@@ -4,11 +4,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>KwaaiNet</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/milligram/1.4.1/milligram.min.css">
-    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
-    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster/dist/MarkerCluster.css" />
-    <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster/dist/MarkerCluster.Default.css" />
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.2/d3.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/topojson/3.0.2/topojson.min.js"></script>
     <!-- Add vis.js for Network Topology -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/vis/4.21.0/vis.min.js"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/vis/4.21.0/vis.min.css" />
@@ -139,10 +137,94 @@
             height: 100%;
         }
 
-        /* Map view */
+        /* Map view — an Equal Earth SVG drawn by d3, not a tile map */
         #map {
             height: 100%;
             width: 100%;
+            position: relative;
+            background: #eef3f7;
+            overflow: hidden;
+        }
+
+        #map svg {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+
+        #map .sphere { fill: #dbe7f0; stroke: #9db4c4; stroke-width: 1; }
+        #map .graticule { fill: none; stroke: #c3d2dd; stroke-width: 0.5; }
+        #map .land { fill: #f7f4ee; stroke: #b5aea2; stroke-width: 0.5; }
+        #map .site { stroke: #fff; stroke-width: 1.5; cursor: pointer; }
+        #map .site:hover { stroke: #333; }
+        #map .site-count {
+            font-weight: bold;
+            fill: #fff;
+            text-anchor: middle;
+            pointer-events: none;
+        }
+        #map .leaf-leg { stroke: #555; }
+
+        #map .map-button {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            padding: 4px 10px;
+            background: #fff;
+            border: 1px solid #bbb;
+            border-radius: 4px;
+            font-size: 1.3rem;
+            cursor: pointer;
+            user-select: none;
+        }
+        #map .map-button:hover { background: #f0f0f0; }
+        #map .map-button-home { right: 76px; }
+
+        #map .map-chip {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            padding: 4px 10px;
+            background: #fff;
+            border: 1px solid #bbb;
+            border-radius: 4px;
+            font-size: 1.3rem;
+            cursor: pointer;
+        }
+
+        #map .map-popup {
+            position: absolute;
+            max-width: 440px;
+            max-height: 70%;
+            overflow: auto;
+            padding: 16px 20px;
+            background: #fff;
+            border: 1px solid #bbb;
+            border-radius: 6px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+            font-size: 1.5rem;
+            line-height: 1.6;
+            z-index: 10;
+        }
+
+        #map .map-popup h5 {
+            margin: 0 0 8px 0;
+            font-size: 1.6rem;
+        }
+
+        #map .map-popup .site-node + .site-node {
+            margin-top: 8px;
+            padding-top: 8px;
+            border-top: 1px solid #ddd;
+        }
+
+        #map .map-popup .close {
+            position: absolute;
+            top: 6px;
+            right: 10px;
+            cursor: pointer;
+            font-size: 1.8rem;
+            line-height: 1;
         }
 
         /* Table view */
@@ -407,17 +489,6 @@
             margin-left: 5px;
         }
 
-        /* Adjust the popup size */
-        .leaflet-popup-content {
-            font-size: 1.5rem;
-            line-height: 1.6;
-            width: 400px;
-        }
-
-        .leaflet-popup-content-wrapper {
-            padding: 20px;
-        }
-
         /* Status indicators */
         .status-online {
             color: green;
@@ -444,6 +515,21 @@
             font-weight: bold;
         }
 
+        .status-unannounced {
+            color: #c0392b;
+            font-weight: bold;
+        }
+
+        /* Role column (VPK) */
+        .role-set {
+            color: #2e6fb4;
+            font-weight: bold;
+        }
+
+        .role-none {
+            color: #aaa;
+        }
+
         /* Throughput colors */
         .throughput-high {
             color: green;
@@ -468,6 +554,11 @@
         
         .connection-relay {
             color: purple;
+            font-weight: bold;
+        }
+
+        .connection-nat {
+            color: teal;
             font-weight: bold;
         }
     </style>
@@ -519,14 +610,14 @@
                 <table id="model-table" class="data-table">
                     <thead>
                         <tr>
-                            <th data-sort="model">Model <span class="sort-indicator"></span></th>
-                            <th data-sort="state">Status <span class="sort-indicator"></span></th>
-                            <th data-sort="location">Location <span class="sort-indicator"></span></th>
                             <th data-sort="publicName">Public Name <span class="sort-indicator"></span></th>
+                            <th data-sort="location">Location <span class="sort-indicator"></span></th>
                             <th data-sort="peerId">Peer ID <span class="sort-indicator"></span></th>
-                            <th data-sort="blocks">Blocks <span class="sort-indicator"></span></th>
-                            <th data-sort="connectionType">Connection Type <span class="sort-indicator"></span></th>
-                            <th data-sort="throughput">Throughput (tok/sec) <span class="sort-indicator"></span></th>
+                            <th data-sort="version">Version <span class="sort-indicator"></span></th>
+                            <th data-sort="connectionType">Connection <span class="sort-indicator"></span></th>
+                            <th data-sort="state">Sharding <span class="sort-indicator"></span></th>
+                            <th data-sort="vpk">VPK <span class="sort-indicator"></span></th>
+                            <th data-sort="throughput">Tok/sec <span class="sort-indicator"></span></th>
                         </tr>
                     </thead>
                     <tbody>
@@ -549,8 +640,6 @@
         </div>
     </div>
 
-    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
-    <script src="https://unpkg.com/leaflet.markercluster/dist/leaflet.markercluster.js"></script>
 
     <script>
         // Tab switching logic with immediate data refresh. The active tab is
@@ -576,12 +665,9 @@
             // If we have current data, immediately update the view
             if (currentData && Object.keys(currentData).length > 0) {
                 if (tabId === 'map-tab' && map) {
-                    // First resize the map container
-                    setTimeout(() => {
-                        map.invalidateSize();
-                        // Then immediately update with current data
-                        updateMapView(currentData);
-                    }, 100);
+                    // The container had no size while hidden; lay out now
+                    // (which also draws the current data).
+                    layoutMap();
                 }
                 else if (tabId === 'table-tab') {
                     // Immediately update table with current data
@@ -627,10 +713,8 @@
         });
 
         // Global variables for network visualization
-        var map;
-        var markers;
+        var map = null;   // { svg, g, projection, path, zoom, popup, chip, ... }
         var intervalId;
-        var openPopups = {}; // To track open popups
         var currentData = []; // Store current data for all views
         
         // Network Topology variables
@@ -726,7 +810,7 @@
                 if (params.nodes.length > 0) {
                     var nodeId = params.nodes[0];
                     var node = nodes.get(nodeId);
-                    alert(`Node: ${node.label}\nModel: ${node.group || 'N/A'}\nStatus: ${node.status || 'N/A'}\nLocation: ${node.location || 'N/A'}`);
+                    alert(`Node: ${node.label}\nModel: ${node.group || 'N/A'}\nSharding: ${node.status || 'N/A'}\nLocation: ${node.location || 'N/A'}`);
                 }
             });
             
@@ -866,34 +950,62 @@
             return `rgba(${r}, ${g}, ${b}, ${alpha})`;
         }
 
+        // Split a peer's identity into name and version. `kwaainet start`
+        // appends `/v<crate version>` to public_name, so strip that suffix —
+        // the Version column shows the same value from the `version` field.
+        function nameAndVersion(server) {
+            const info = (server.span && server.span.server_info) || {};
+            const name = (info.public_name || "").replace(/\/v\d[\w.+-]*$/, "");
+            // The DHT field reads `kwaai-0.6.8`, identify's agent `kwaainet/0.7.0`;
+            // the table wants the number.
+            const version = (info.version || "").replace(/^[^-\/]*[-\/]/, "");
+            return { name: name || "N/A", version: version || "N/A" };
+        }
+
         // Helper function to get connection type
-        // Derived from the peer's advertised multiaddrs so it stays consistent
+        // Derived from the peer's observed multiaddrs so it stays consistent
         // with the Location column (which uses the same multiaddr signal). The
         // node-self-reported `using_relay` field is computed from config-time
-        // intent rather than runtime reachability, so it can lie — a NATed peer
-        // with any `announce_addr` configured will still report `using_relay:
-        // false` even when its only published address is a /p2p-circuit/.
+        // intent rather than runtime reachability, so it can understate NAT — a
+        // NATed peer with any `announce_addr` configured will still report
+        // `using_relay: false` even when its only published address is a
+        // /p2p-circuit/. It cannot overstate it, so a peer that says it needs a
+        // relay yet was reached without one is a NATed peer the observer
+        // hole-punched: reachable to a DCUtR-capable dialer, not to anyone.
         function getConnectionType(server) {
+            const info = server.span && server.span.server_info;
+            // A map-server that classified the connection itself — by which
+            // side dialed, and whether DCUtR punched — is believed outright.
+            const verdict = server.peer_ip_info && server.peer_ip_info.reachability;
+            if (verdict) {
+                return { direct: "Direct", punched: "NAT", relayed: "Relay",
+                         inbound: info && info.using_relay ? "Relay" : "Direct" }[verdict] || "Unknown";
+            }
             const addrs = server.peer_ip_info && server.peer_ip_info.multiaddrs;
             if (Array.isArray(addrs) && addrs.length > 0) {
-                return addrs.some(a => typeof a === 'string' && a.includes('/p2p-circuit')) ? "Relay" : "Direct";
+                if (addrs.some(a => typeof a === 'string' && a.includes('/p2p-circuit'))) {
+                    return "Relay";
+                }
+                return info && info.using_relay ? "NAT" : "Direct";
             }
-            if (server.span && server.span.server_info) {
+            if (info) {
                 // Fallback: trust the node's self-report when no multiaddrs are visible.
-                return server.span.server_info.using_relay ? "Relay" : "Direct";
+                return info.using_relay ? "Relay" : "Direct";
             }
             return "Unknown";
         }
+
+        const CONNECTION_TYPE_STYLE = {
+            "Direct":        { cls: "connection-direct", color: "blue",   shape: "dot" },
+            "NAT":           { cls: "connection-nat",    color: "teal",   shape: "triangle" },
+            "Relay":         { cls: "connection-relay",  color: "purple", shape: "diamond" },
+        };
+        const connectionTypeStyle = (type) => CONNECTION_TYPE_STYLE[type] || { cls: "", color: "black", shape: "diamond" };
         
         // Helper function to get connection type HTML
         function getConnectionTypeHtml(type) {
-            if (type === "Direct") {
-                return `<span class="connection-direct">${type}</span>`;
-            } else if (type === "Relay") {
-                return `<span class="connection-relay">${type}</span>`;
-            } else {
-                return type;
-            }
+            const { cls } = connectionTypeStyle(type);
+            return cls ? `<span class="${cls}">${type}</span>` : type;
         }
 
         // Wire states are Petals' ServerState, which is about readiness to serve
@@ -904,89 +1016,410 @@
         // state when its own probe of an ONLINE server fails. Departed is v2-only
         // for the same kind of reason — hivemind drops a record carrying the -1
         // tombstone rather than decoding it, so v1 never sees one.
-        const STATUS_LABELS = { online: 'Sharding', joining: 'Idle', offline: 'Departed', unreachable: 'Unreachable' };
+        // `unannounced`: reached over kad, but no record of it in the DHT —
+        // up, and either not announcing or failing to.
+        const STATUS_LABELS = { online: 'Sharding', joining: 'Idle', offline: 'Departed', unreachable: 'Unreachable', unannounced: 'Unannounced' };
         const statusLabel = (state) => STATUS_LABELS[state] || 'Unknown';
         const statusClass = (state) => `status-${STATUS_LABELS[state] ? state : 'unknown'}`;
 
         // JOINING is two situations. A node only claims Loading while a shard is
         // actually loading; everything else that is up but not serving reads
         // Idle, which promises nothing — including nodes too old to say.
+        // The range rides on the label only where it means something: the
+        // blocks a Serving node answers for, or a Loading node is fetching.
+        // Idle and Departed nodes still announce one, but it promises nothing.
+        const blockRange = (server) => server.span && server.span.start != null ? `[${server.span.start}:${server.span.end}]` : '';
         const serverStatus = (server) => {
             const info = (server.span && server.span.server_info) || {};
-            return server.state === 'joining' && info.shard_loading
-                ? 'Loading'
-                : statusLabel(server.state);
+            if (server.state === 'online') return `Serving ${blockRange(server)}`;
+            if (server.state === 'joining' && info.shard_loading) return `Loading ${blockRange(server)}`;
+            return statusLabel(server.state);
         };
 
+        // A node announces a role only when the service behind it answers
+        // its local health check, so absence means "not advertising", not
+        // "not running". Bobs never advertise: nothing on a Bob serves a
+        // health endpoint, so a remote peer is told of Eves only.
+        const ROLE_LABELS = { eve: 'Eve', bob: 'Bob', both: 'Eve + Bob' };
+        const roleLabel = (cap) => {
+            if (!cap || typeof cap !== 'object') return '';
+            const mode = String(cap.mode || '').toLowerCase();
+            return ROLE_LABELS[mode] || (mode ? mode : 'Yes');
+        };
+        const vpkRole = (server) => roleLabel(((server.span || {}).server_info || {}).vpk);
+        const roleCell = (label) => label
+            ? `<span class="role-set">${label}</span>`
+            : '<span class="role-none">—</span>';
+
+        // Every view draws from `peers`: each peer the observer identified
+        // over kad or found named in the DHT, serving or not — shaped like the
+        // v1 server rows the helpers above read. A map-server without `peers`
+        // falls back to flattening model_reports, so the older API still renders.
+        const NO_MODEL = 'No model';
+        function peerRows(data) {
+            if (Array.isArray(data.peers)) {
+                return data.peers.map(p => ({
+                    model: p.model || null,
+                    server: {
+                        peer_id: p.peer_id,
+                        state: p.state,
+                        kad: p.kad,
+                        announced: p.announced,
+                        peer_ip_info: p.peer_ip_info || {},
+                        span: {
+                            start: p.span ? p.span.start : null,
+                            end: p.span ? p.span.end : null,
+                            server_info: {
+                                public_name: p.public_name,
+                                version: p.version,
+                                throughput: p.throughput,
+                                using_relay: p.using_relay,
+                                vpk: p.vpk,
+                                shard_loading: p.shard_loading,
+                                trust_attestations: p.trust_attestations,
+                            },
+                        },
+                    },
+                }));
+            }
+            const rows = [];
+            (data.model_reports || []).forEach(report =>
+                report.server_rows.forEach(server => rows.push({ model: report.name, server })));
+            return rows;
+        }
+
         // Map View Logic
-        function updateMapView(data) {
-            markers.clearLayers();
-            
-            data.model_reports.forEach(report => {
-                report.server_rows.forEach(server => {
-                    const location = server.peer_ip_info.location;
-                    const blocks = server.span ? server.span.start + "-" + server.span.end : "N/A";
-                    let lat = 34.0522;
-                    let lon = -118.2437;
-                    let locationInfo = "Location Unknown";
-                    
-                    if (location && location.status === "success") {
-                        lat = location.lat;
-                        lon = location.lon;
-                        locationInfo = `${location.city}, ${location.country}`;
-                    }
+        //
+        // Equal Earth (Šavrič, Patterson & Jenny 2018), the equal-area
+        // projection the UN adopted for its world maps, drawn as SVG by d3.
+        // Mercator — what tile maps are stuck with — inflates the high
+        // latitudes, so a node in Oslo read as much of the world as one in
+        // Lagos. There are no raster tiles at this projection, so the base is
+        // a vector coastline (world-atlas 110m) fetched once per page load.
+        const WORLD_ATLAS_URL = 'https://cdn.jsdelivr.net/npm/world-atlas@2.0.2/countries-110m.json';
+        const MAP_MIN_RADIUS = 6;
+        const MAP_MAX_ZOOM = 12;
+        // Where the eye lands first. The projection is centred on the Atlantic
+        // (central meridian 30°W) so North America and Europe share the middle
+        // band, and the page opens zoomed on the North Atlantic — Los Angeles
+        // to Moscow — where most of the network is. "World" zooms back out.
+        const MAP_CENTRAL_MERIDIAN = -30;
+        const MAP_HOME = { lon: -40, lat: 38, zoom: 1.85 };
 
-                    // Color markers based on status
-                    let markerColor = { online: 'green', joining: 'orange', unreachable: 'red' }[server.state] || 'grey';
-                    let markerIcon = L.icon({
-                        iconUrl: `https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-${markerColor}.png`,
-                        iconSize: [25, 41],
-                        iconAnchor: [12, 41],
-                        popupAnchor: [1, -34],
-                        shadowUrl: 'https://unpkg.com/leaflet@1.7.1/dist/images/marker-shadow.png',
-                        shadowSize: [41, 41]
-                    });
+        const STATUS_COLORS = { online: '#2e8b57', joining: '#e8891d', unreachable: '#d0342c', unannounced: '#c0392b', offline: '#8a8a8a' };
+        // A site's colour is its most alarming node's.
+        const STATUS_PRIORITY = ['unreachable', 'joining', 'online', 'offline'];
 
-                    // Get throughput and determine its color
-                    const throughput = server.span && server.span.server_info ? server.span.server_info.throughput : 0;
-                    let throughputColor = "#FF0000"; // Default to red
-                    if (throughput > 500) {
-                        throughputColor = "#00FF00"; // Green for high throughput
-                    } else if (throughput > 100) {
-                        throughputColor = "#FFFF00"; // Yellow for medium throughput
-                    }
+        function initMap() {
+            const container = document.getElementById('map');
+            const projection = d3.geoEqualEarth().rotate([-MAP_CENTRAL_MERIDIAN, 0]);
+            const path = d3.geoPath(projection);
 
-                    let publicName = server.span && server.span.server_info ? (server.span.server_info.public_name || "N/A") : "N/A";
-                    
-                    // Get connection type
-                    const connectionType = getConnectionType(server);
-                    const connectionTypeColor = connectionType === "Direct" ? "blue" : connectionType === "Relay" ? "purple" : "black";
+            // The viewBox is 1000 wide and takes the container's aspect, with
+            // the sphere fitted and centred in it, so the map fills the frame
+            // with no letterbox and the pan clamp is the frame edge. Resizing
+            // the window re-lays it out (see layoutMap).
+            const width = 1000;
+            const svg = d3.select(container).append('svg')
+                .attr('preserveAspectRatio', 'xMidYMid meet');
+            const g = svg.append('g');
 
-                    let marker = L.marker([lat, lon], { icon: markerIcon });
-                    let popupContent = `
-                        <b>Model:</b> ${report.name}<br>
-                        <b>Status:</b> <span class="${statusClass(server.state)}">${serverStatus(server)}</span><br>
-                        <b>Location:</b> ${locationInfo}<br>
-                        <b>Public Name:</b> ${publicName}<br>
-                        <b>Blocks:</b> ${blocks}<br>
-                        <b>Connection Type:</b> <span style="color:${connectionTypeColor}; font-weight:bold;">${connectionType}</span><br>
-                        <b>Throughput (tok/sec):</b>                                 
-                        <span style="color:${throughputColor}">${throughput ? throughput.toFixed(2) : "N/A"}</span>                                
-                    `;
-                    
-                    marker.bindPopup(popupContent);
-                    markers.addLayer(marker);
-                    
-                    // Check if this marker was previously open
-                    let key = lat + "," + lon;
-                    if (openPopups[key]) {
-                        // Store this marker to open its popup later
-                        openPopups[key] = marker;
-                    }
+            g.append('path').datum({ type: 'Sphere' }).attr('class', 'sphere').attr('d', path);
+            g.append('path').datum(d3.geoGraticule10()).attr('class', 'graticule').attr('d', path);
+            const land = g.append('g').attr('class', 'land-layer');
+            const sites = g.append('g').attr('class', 'sites-layer');
+
+            const zoom = d3.zoom()
+                .scaleExtent([1, MAP_MAX_ZOOM])
+                .on('zoom', (event) => {
+                    g.attr('transform', event.transform);
+                    // Keep pins the same size on screen whatever the zoom.
+                    map.k = event.transform.k;
+                    restyleSites();
+                    closePopup();
                 });
+            svg.call(zoom).on('dblclick.zoom', null);
+            svg.on('click', (event) => {
+                if (event.target.tagName === 'circle') return;
+                closePopup();
+                collapseSite();
             });
-            
-            map.addLayer(markers);
+
+            const chip = d3.select(container).append('div').attr('class', 'map-chip').style('display', 'none');
+            const popup = d3.select(container).append('div').attr('class', 'map-popup').style('display', 'none');
+
+            map = { container, svg, g, projection, path, zoom, land, sites, chip, popup, k: 1, width, height: 0, home: null };
+
+            d3.select(container).append('div').attr('class', 'map-button').text('World')
+                .attr('title', 'Zoom out to the whole world')
+                .on('click', () => svg.transition().duration(600).call(zoom.transform, d3.zoomIdentity));
+            d3.select(container).append('div').attr('class', 'map-button map-button-home').text('Home')
+                .attr('title', 'Back to the North Atlantic')
+                .on('click', () => svg.transition().duration(600).call(zoom.transform, map.home));
+
+            layoutMap();
+
+            d3.json(WORLD_ATLAS_URL).then(world => {
+                const countries = topojson.feature(world, world.objects.countries);
+                land.append('path').datum(countries).attr('class', 'land').attr('d', path);
+            }).catch(err => {
+                // Graticule and sphere still give the pins a frame.
+                console.warn('map: world atlas unavailable, drawing without coastlines', err);
+            });
+        }
+
+        // Size the viewBox to the container, fit the sphere, redraw the base
+        // layers and return to the home view. Called at init and on resize;
+        // the map is hidden on the other tabs, so a zero-sized container keeps
+        // the previous layout.
+        function layoutMap() {
+            const { container, svg, g, projection, path, width } = map;
+            const box = container.getBoundingClientRect();
+            if (box.width === 0 || box.height === 0) return;
+            const height = Math.round(width * box.height / box.width);
+
+            projection.fitSize([width, height], { type: 'Sphere' });
+            const [[x0, y0], [x1, y1]] = path.bounds({ type: 'Sphere' });
+            const [tx, ty] = projection.translate();
+            projection.translate([tx + (width - (x1 + x0)) / 2, ty + (height - (y1 + y0)) / 2]);
+
+            map.height = height;
+            svg.attr('viewBox', `0 0 ${width} ${height}`);
+            g.selectAll('path.sphere, path.graticule, path.land').attr('d', path);
+            // Pan no further than the sphere itself: a zoomed view then rests
+            // with the pole at the frame edge rather than on empty margin.
+            // d3.zoom measures the viewport in element pixels by default; tell
+            // it the viewBox, since that is the unit the clamp is in.
+            const viewport = [[0, 0], [width, height]];
+            const sphere = path.bounds({ type: 'Sphere' });
+            map.zoom.extent(viewport).translateExtent(sphere);
+
+            // d3 constrains gestures, not programmatic transforms, so the home
+            // view is put through the same clamp by hand.
+            const [hx, hy] = projection([MAP_HOME.lon, MAP_HOME.lat]);
+            const centred = d3.zoomIdentity
+                .translate(width / 2 - MAP_HOME.zoom * hx, height / 2 - MAP_HOME.zoom * hy)
+                .scale(MAP_HOME.zoom);
+            map.home = map.zoom.constrain()(centred, viewport, sphere);
+            // Applying a transform runs the zoom handler, which reads `map`.
+            svg.call(map.zoom.transform, map.home);
+            if (currentData && (currentData.peers || currentData.model_reports)) updateMapView(currentData);
+        }
+
+        function closePopup() {
+            if (map) map.popup.style('display', 'none');
+        }
+
+        // A shared site is drawn bigger, and big enough to hold its count.
+        function siteRadius(site) {
+            const n = site.nodes.length;
+            return n > 1 ? MAP_MIN_RADIUS + 3 + 2 * Math.sqrt(n - 1) : MAP_MIN_RADIUS;
+        }
+
+        const siteKey = (site) => `${site.lat},${site.lon}`;
+
+        // Everything drawn in screen pixels: divided by the zoom so pins,
+        // badges and the expanded ring keep their size on screen.
+        function restyleSites() {
+            const k = map.k;
+            map.sites.selectAll('g.site-group > circle')
+                .attr('r', d => siteRadius(d) / k)
+                .attr('stroke-width', 1.5 / k);
+            map.sites.selectAll('g.site-group > text')
+                .attr('font-size', `${10 / k}px`);
+            map.sites.selectAll('g.leaf-group').attr('transform', d => {
+                const [dx, dy] = leafOffset(d);
+                return `translate(${dx / k},${dy / k})`;
+            });
+            map.sites.selectAll('g.leaf-group circle')
+                .attr('r', MAP_MIN_RADIUS / k)
+                .attr('stroke-width', 1.5 / k);
+            map.sites.selectAll('line.leaf-leg')
+                .attr('stroke-width', 1 / k)
+                .attr('x2', d => leafOffset(d)[0] / k)
+                .attr('y2', d => leafOffset(d)[1] / k);
+        }
+
+        // Where a leaf sits when its site is expanded: a ring around the site
+        // wide enough for its members, in screen pixels.
+        function leafOffset(leaf) {
+            const n = leaf.site.nodes.length;
+            const ring = 22 + 2.5 * n;
+            const angle = (2 * Math.PI * leaf.i) / n - Math.PI / 2;
+            return [ring * Math.cos(angle), ring * Math.sin(angle)];
+        }
+
+        // Click on a shared site fans its nodes out (the old marker cluster's
+        // spiderfy); click on the site again, or on the map, folds them back.
+        function expandSite(site) {
+            map.expanded = map.expanded === siteKey(site) ? null : siteKey(site);
+            updateMapView(currentData);
+        }
+
+        function collapseSite() {
+            if (map && map.expanded) {
+                map.expanded = null;
+                updateMapView(currentData);
+            }
+        }
+
+        function siteColor(site) {
+            const states = new Set(site.nodes.map(n => n.server.state));
+            const worst = STATUS_PRIORITY.find(st => states.has(st));
+            return STATUS_COLORS[worst] || STATUS_COLORS.offline;
+        }
+
+        function nodePopupHtml(node) {
+            const { server, report } = node;
+            const throughput = server.span && server.span.server_info ? server.span.server_info.throughput : 0;
+            let throughputColor = "#FF0000"; // Default to red
+            if (throughput > 500) {
+                throughputColor = "#00FF00"; // Green for high throughput
+            } else if (throughput > 100) {
+                throughputColor = "#FFFF00"; // Yellow for medium throughput
+            }
+            const { name: publicName, version } = nameAndVersion(server);
+            const connectionType = getConnectionType(server);
+            const connectionTypeColor = connectionTypeStyle(connectionType).color;
+            return `<div class="site-node">
+                <b>Model:</b> ${report.name}<br>
+                <b>Sharding:</b> <span class="${statusClass(server.state)}">${serverStatus(server)}</span><br>
+                <b>VPK:</b> ${roleCell(vpkRole(server))}<br>
+                <b>Public Name:</b> ${publicName}<br>
+                <b>Version:</b> ${version}<br>
+                <b>Connection:</b> <span style="color:${connectionTypeColor}; font-weight:bold;">${connectionType}</span><br>
+                <b>Tok/sec:</b> <span style="color:${throughputColor}">${throughput ? throughput.toFixed(2) : "N/A"}</span>
+            </div>`;
+        }
+
+        // Show every node at a site, anchored near a point in the container.
+        function openPopup(site, x, y) {
+            const heading = site.nodes.length === 1
+                ? site.label
+                : `${site.nodes.length} nodes · ${site.label}`;
+            map.popup.html(`<span class="close" title="Close">&times;</span><h5>${heading}</h5>`
+                    + site.nodes.map(nodePopupHtml).join(''))
+                .style('display', 'block');
+            map.popup.select('.close').on('click', closePopup);
+
+            // Keep it inside the container: prefer right of and below the
+            // point, flip when that would overflow.
+            const box = map.container.getBoundingClientRect();
+            const pw = map.popup.node().offsetWidth, ph = map.popup.node().offsetHeight;
+            const left = x + 12 + pw > box.width ? Math.max(0, x - 12 - pw) : x + 12;
+            const top = y + ph > box.height ? Math.max(0, box.height - ph - 4) : y;
+            map.popup.style('left', `${left}px`).style('top', `${top}px`);
+        }
+
+        // Group servers by location. Sites are what get drawn: one circle per
+        // distinct coordinate, sized by how many nodes share it — the same job
+        // Leaflet's marker clusters used to do, but exact rather than
+        // proximity-based, which is what a per-city geoip resolves to anyway.
+        function collectSites(data) {
+            const located = new Map();
+            const unknown = { label: 'Location unknown', nodes: [] };
+            peerRows(data).forEach(({ server, model }) => {
+                const report = { name: model || NO_MODEL };
+                const location = server.peer_ip_info && server.peer_ip_info.location;
+                if (!(location && location.status === "success")) {
+                    unknown.nodes.push({ server, report });
+                    return;
+                }
+                const key = `${location.lat},${location.lon}`;
+                if (!located.has(key)) {
+                    located.set(key, {
+                        lat: location.lat, lon: location.lon,
+                        label: `${location.city}, ${location.country}`,
+                        nodes: [],
+                    });
+                }
+                located.get(key).nodes.push({ server, report });
+            });
+            return { sites: [...located.values()], unknown };
+        }
+
+        function updateMapView(data) {
+            if (!map) return;
+            const { sites, unknown } = collectSites(data);
+            sites.forEach(site => { [site.x, site.y] = map.projection([site.lon, site.lat]); });
+
+            const groups = map.sites.selectAll('g.site-group')
+                .data(sites, d => `${d.lat},${d.lon}`)
+                .join(enter => {
+                    const gr = enter.append('g').attr('class', 'site-group');
+                    gr.append('circle').attr('class', 'site').append('title');
+                    gr.append('text').attr('class', 'site-count').attr('dominant-baseline', 'central');
+                    return gr;
+                });
+            groups.attr('transform', d => `translate(${d.x},${d.y})`);
+
+            // Leaves first so they draw under their site's circle.
+            const expanded = sites.find(site => siteKey(site) === map.expanded);
+            const leafData = expanded
+                ? expanded.nodes.map((node, i) => ({ node, site: expanded, i }))
+                : [];
+            map.sites.selectAll('g.leaf-group')
+                .data(leafData, d => d.node.server.peer_id)
+                .join(enter => {
+                    const gr = enter.append('g').attr('class', 'leaf-group');
+                    gr.append('circle').attr('class', 'site leaf');
+                    gr.append('title');
+                    return gr;
+                })
+                .each(function (d) {
+                    d3.select(this).select('circle')
+                        .attr('fill', STATUS_COLORS[d.node.server.state] || STATUS_COLORS.offline)
+                        .on('click', (event) => {
+                            event.stopPropagation();
+                            const [x, y] = d3.pointer(event, map.container);
+                            openPopup({ label: d.site.label, nodes: [d.node] }, x, y);
+                        });
+                    d3.select(this).select('title').text(nameAndVersion(d.node.server).name);
+                });
+            const legs = groups.filter(d => d === expanded).selectAll('line.leaf-leg')
+                .data(leafData, d => d.node.server.peer_id)
+                .join('line').attr('class', 'leaf-leg').attr('x1', 0).attr('y1', 0);
+            groups.filter(d => d !== expanded).selectAll('line.leaf-leg').remove();
+            // Leaves are positioned relative to their site, so parent them there.
+            groups.filter(d => d === expanded).each(function () {
+                const parent = this;
+                map.sites.selectAll('g.leaf-group').each(function () { parent.appendChild(this); });
+            });
+            groups.each(function () {
+                // Site circle and count on top of legs and leaves.
+                const el = d3.select(this);
+                this.appendChild(el.select('circle.site:not(.leaf)').node());
+                this.appendChild(el.select('text').node());
+            });
+
+            groups.select('circle.site:not(.leaf)')
+                .attr('fill', siteColor)
+                .on('click', (event, d) => {
+                    event.stopPropagation();
+                    if (d.nodes.length > 1) {
+                        closePopup();
+                        expandSite(d);
+                        return;
+                    }
+                    const [x, y] = d3.pointer(event, map.container);
+                    openPopup(d, x, y);
+                })
+                .select('title').text(d => `${d.label}: ${d.nodes.length} node${d.nodes.length === 1 ? '' : 's'}`);
+            groups.select('text')
+                .text(d => d.nodes.length > 1 ? d.nodes.length : '');
+            restyleSites();
+
+            // Unlocated nodes get a chip in the corner rather than a fake pin.
+            if (unknown.nodes.length > 0) {
+                map.chip.style('display', 'block')
+                    .text(`Location unknown: ${unknown.nodes.length}`)
+                    .on('click', (event) => {
+                        event.stopPropagation();
+                        openPopup(unknown, 10, 40);
+                    });
+            } else {
+                map.chip.style('display', 'none');
+            }
         }
 
         // Table View Logic
@@ -1060,7 +1493,7 @@
             if (pageData.length === 0) {
                 const row = document.createElement('tr');
                 const cell = document.createElement('td');
-                cell.colSpan = 8; // Updated column count
+                cell.colSpan = 8;
                 cell.textContent = 'No data found';
                 cell.style.textAlign = 'center';
                 row.appendChild(cell);
@@ -1071,33 +1504,28 @@
             pageData.forEach(rowData => {
                 const row = document.createElement('tr');
                 
-                // Model
-                const modelCell = document.createElement('td');
-                modelCell.textContent = rowData.model;
-                row.appendChild(modelCell);
-                
-                // Status
-                const stateCell = document.createElement('td');
-                stateCell.innerHTML = `<span class="${statusClass(rowData.stateKey)}">${rowData.state}</span>`;
-                row.appendChild(stateCell);
-                
-                // Location
-                const locationCell = document.createElement('td');
-                locationCell.textContent = rowData.location;
-                row.appendChild(locationCell);
                 
                 // Public Name
                 const publicNameCell = document.createElement('td');
                 publicNameCell.textContent = rowData.publicName;
                 row.appendChild(publicNameCell);
 
+                // Location
+                const locationCell = document.createElement('td');
+                locationCell.textContent = rowData.location;
+                row.appendChild(locationCell);
+
                 // Peer ID (abbreviated, full ID in tooltip, with copy button)
                 const peerIdCell = document.createElement('td');
                 peerIdCell.className = 'peer-id-cell';
                 const fullPeerId = rowData.peerId || '';
                 const peerIdText = document.createElement('span');
+                // The leading `12D3KooW` is the multihash header every Ed25519
+                // key shares (`Qm` for RSA), not identity — only the tail tells
+                // peers apart. Two leading characters name the key type; the
+                // full id stays in the tooltip and on copy.
                 if (fullPeerId && fullPeerId.length > 16) {
-                    peerIdText.textContent = fullPeerId.slice(0, 12) + '…' + fullPeerId.slice(-4);
+                    peerIdText.textContent = fullPeerId.slice(0, 2) + '…' + fullPeerId.slice(-8);
                 } else {
                     peerIdText.textContent = fullPeerId || 'N/A';
                 }
@@ -1154,21 +1582,31 @@
                 }
                 row.appendChild(peerIdCell);
 
-                // Blocks
-                const blocksCell = document.createElement('td');
-                blocksCell.textContent = rowData.blocks;
-                row.appendChild(blocksCell);
-                
+                // Version
+                const versionCell = document.createElement('td');
+                versionCell.textContent = rowData.version;
+                row.appendChild(versionCell);
+
                 // Connection Type
                 const connectionTypeCell = document.createElement('td');
                 connectionTypeCell.innerHTML = getConnectionTypeHtml(rowData.connectionType);
                 row.appendChild(connectionTypeCell);
-                
+
+                // Status
+                const stateCell = document.createElement('td');
+                stateCell.innerHTML = `<span class="${statusClass(rowData.stateKey)}">${rowData.state}</span>`;
+                row.appendChild(stateCell);
+
+                // VPK role
+                const vpkCell = document.createElement('td');
+                vpkCell.innerHTML = roleCell(rowData.vpk);
+                row.appendChild(vpkCell);
+
                 // Throughput
                 const throughputCell = document.createElement('td');
                 throughputCell.innerHTML = getThroughputHtml(rowData.throughput);
                 row.appendChild(throughputCell);
-                
+
                 tableBody.appendChild(row);
             });
             
@@ -1251,8 +1689,17 @@
                 }
             ]);
             
-            // Extract unique model names
-            const modelNames = [...new Set(data.model_reports.map(report => report.name))];
+            // One group per model; peers serving none sit under NO_MODEL,
+            // which gets no API or model node — they hang off the bootstraps.
+            const rows = peerRows(data);
+            const rowsByModel = new Map();
+            rows.forEach(({ server, model }) => {
+                const name = model || NO_MODEL;
+                if (!rowsByModel.has(name)) rowsByModel.set(name, []);
+                rowsByModel.get(name).push(server);
+            });
+            const modelNames = [...rowsByModel.keys()].filter(name => name !== NO_MODEL);
+            modelColors[NO_MODEL] = '#8a8a8a';
             
             // Add tier 2: API servers for each model
             const apiNodes = [];
@@ -1349,11 +1796,10 @@
             });
             
             // Now add server nodes
-            data.model_reports.forEach(report => {
-                const modelName = report.name;
+            rowsByModel.forEach((servers, modelName) => {
                 const modelNodeId = `model-${modelName}`;
                 
-                report.server_rows.forEach((server, serverIndex) => {
+                servers.forEach((server, serverIndex) => {
                     // Create a unique ID for this server
                     const serverId = `${modelName}-server-${serverIndex}`;
                     
@@ -1366,9 +1812,7 @@
                     }
                     
                     // Get additional server info
-                    const blocks = server.span ? `${server.span.start}-${server.span.end}` : "N/A";
-                    const publicName = server.span && server.span.server_info ? 
-                        (server.span.server_info.public_name || "N/A") : "N/A";
+                    const publicName = nameAndVersion(server).name;
                     const connectionType = getConnectionType(server);
                     const throughput = server.span && server.span.server_info ? 
                         server.span.server_info.throughput : 0;
@@ -1385,12 +1829,11 @@
                         location: locationInfo,
                         throughput: throughput ? throughput.toFixed(2) : "N/A",
                         connectionType: connectionType,
-                        blocks: blocks,
-                        title: `Model: ${modelName}<br>Status: ${serverStatus(server)}<br>Location: ${locationInfo}<br>Blocks: ${blocks}`,
+                        title: `Model: ${modelName}<br>Sharding: ${serverStatus(server)}<br>VPK: ${vpkRole(server) || "—"}<br>Location: ${locationInfo}`,
                         borderWidth: 2,
                         level: 2,
                         // Different shape based on connection type
-                        shape: connectionType === "Direct" ? "dot" : "diamond",
+                        shape: connectionTypeStyle(connectionType).shape,
                         // Different color shade based on status
                         color: {
                             background: server.state === 'online' ? modelColors[modelName] : '#d3d3d3',
@@ -1401,12 +1844,14 @@
                     });
                     
                     // Connect server node to its model group node
-                    edges.add({
-                        from: modelNodeId,
-                        to: serverId,
-                        length: 100,
-                        arrows: 'to'
-                    });
+                    if (modelName !== NO_MODEL) {
+                        edges.add({
+                            from: modelNodeId,
+                            to: serverId,
+                            length: 100,
+                            arrows: 'to'
+                        });
+                    }
                     
                     // Connect server node directly to bootstrap nodes with dotted lines
                     edges.add([
@@ -1528,33 +1973,32 @@
             // Flatten data for tabular presentation
             tableData = [];
             
-            data.model_reports.forEach(report => {
-                report.server_rows.forEach(server => {
+            peerRows(data).forEach(({ server, model }) => {
+                {
                     const location = server.peer_ip_info.location;
                     const locationInfo = location && location.status === "success" ? 
                         `${location.city}, ${location.country}` : "Location Unknown";
                     
-                    const blocks = server.span ? `${server.span.start}-${server.span.end}` : "N/A";
                     const throughput = server.span && server.span.server_info ? server.span.server_info.throughput : 0;
-                    const publicName = server.span && server.span.server_info ? 
-                        (server.span.server_info.public_name || "N/A") : "N/A";
+                    const { name: publicName, version } = nameAndVersion(server);
                     const connectionType = getConnectionType(server);
                     
                     tableData.push({
-                        model: report.name,
+                        model: model || NO_MODEL,
                         location: locationInfo,
                         publicName: publicName,
+                        version: version,
                         peerId: server.peer_id || "",
-                        blocks: blocks,
                         throughput: throughput ? throughput.toFixed(2) : "N/A",
                         // The label is the row's value so the Status column
                         // sorts and the search box matches on what is displayed;
                         // the wire value rides along for the colour class.
                         state: serverStatus(server),
                         stateKey: server.state,
+                        vpk: vpkRole(server),
                         connectionType: connectionType
                     });
-                });
+                }
             });
             
             // Update the view
@@ -1649,18 +2093,8 @@
 
         // Initialize map on page load
         document.addEventListener('DOMContentLoaded', function() {
-            // Center horizontally on the UK (lon 0) but drop a bit south
-            // (lat 30) at zoom 2 so London sits near the top-centre and the
-            // populated world (Americas → East Asia, plus Africa/Oceania)
-            // stays in frame without horizontal wrap. worldCopyJump keeps
-            // markers visible if a user does scroll past the antimeridian.
-            map = L.map('map', { worldCopyJump: true }).setView([30, 0], 2);
-            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                maxZoom: 18,
-            }).addTo(map);
-            
-            markers = L.markerClusterGroup();
-            
+            initMap();
+
             // Setup refresh controls
             const refreshCheckbox = document.getElementById('refresh-enabled');
             const intervalSelect = document.getElementById('interval-select');
@@ -1698,7 +2132,7 @@
             const activeTab = document.querySelector('.tab.active').getAttribute('data-tab');
             
             if (activeTab === 'map-tab' && map) {
-                map.invalidateSize();
+                layoutMap();
             } else if (activeTab === 'topology-tab' && network) {
                 network.fit();
             }
