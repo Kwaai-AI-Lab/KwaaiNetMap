@@ -7,12 +7,21 @@ crates are produced locally and gitignored.
 `fetch-patches.sh` is the single entry point — it runs every per-crate fetch
 script and is what the Dockerfile and CI call.
 
-A libp2p-kad patch used to live here too, restoring the `set_protocol_names`
-setter kwaai-p2p needed to serve `/kwaai/kad/1.0.0` alongside the legacy
-`/ipfs/kad/1.0.0`. Since kwaai-p2p 0.6.8 that call sits behind the crate's
-`kad-multi-protocol` feature, which the map does not take: it ships after
-0.6.8 has propagated, so there is no pre-migration node left to reach over the
-old name. Nothing here needs the setter, and the patch is gone.
+## libp2p-kad (peerstore answers, temporary)
+
+`libp2p-kad 0.48.0` with KwaaiNet's `core/patches/libp2p-kad.patch` at
+v0.7.0, byte for byte. It is here because kwaai-p2p 0.7.0 calls
+`Behaviour::set_peerstore_addresses`, which only that patch defines — the
+crate's own publish failed on exactly that line, so 0.7.0 exists as a git tag
+and not on crates.io, and this manifest takes it from the tag. `[patch.crates-io]`
+never crosses into a dependency, so the patch has to be repeated here, as
+multistream-select is.
+
+Temporary: KwaaiNet#216 drops the peerstore call, at which point kwaai-p2p
+publishes again, the dependency goes back to a crates.io version, and this
+patch and its fetch script go with it. It had already been removed once —
+the `set_protocol_names` setter it also restores sits behind kwaai-p2p's
+`kad-multi-protocol` feature, which the map does not take.
 
 ## multistream-select (slash-less protocol IDs)
 
