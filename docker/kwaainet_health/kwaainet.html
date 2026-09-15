@@ -1398,11 +1398,12 @@
         let tableData = []; // Store the table data
         let currentPage = 1;
         let rowsPerPage = 15;
-        let sortField = 'model';
+        let sortField = 'state';
         let sortDirection = 'asc';
         let filteredData = [];
         
         // Sort function for table data
+        const STATE_RANK = ['Serving', 'Loading', 'Idle', 'Unreachable', 'Unannounced', 'Departed', 'Unknown'];
         function sortTableData(data, field, direction) {
             return [...data].sort((a, b) => {
                 let valueA = a[field];
@@ -1412,6 +1413,11 @@
                 if (field === 'throughput') {
                     valueA = valueA === 'N/A' ? -1 : parseFloat(valueA);
                     valueB = valueB === 'N/A' ? -1 : parseFloat(valueB);
+                }
+                // Sharding sorts by usefulness, not by letter.
+                if (field === 'state') {
+                    valueA = STATE_RANK.indexOf(valueA);
+                    valueB = STATE_RANK.indexOf(valueB);
                 }
                 
                 if (valueA < valueB) {
@@ -1961,7 +1967,8 @@
                         publicName: publicName,
                         version: version,
                         peerId: server.peer_id || "",
-                        throughput: throughput ? throughput.toFixed(2) : "N/A",
+                        // The record's rate is a placeholder unless it is serving.
+                        throughput: server.state === 'online' && throughput ? throughput.toFixed(2) : "N/A",
                         // The label is the row's value so the Status column
                         // sorts and the search box matches on what is displayed;
                         // the wire value rides along for the colour class.
