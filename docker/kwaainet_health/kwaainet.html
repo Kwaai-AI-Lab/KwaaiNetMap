@@ -1426,6 +1426,8 @@
                 if (valueA > valueB) {
                     return direction === 'asc' ? 1 : -1;
                 }
+                // Within a state, ranges read in block order either way up.
+                if (field === 'state') return a.blockStart - b.blockStart;
                 return 0;
             });
         }
@@ -1974,6 +1976,7 @@
                         // the wire value rides along for the colour class.
                         state: serverStatus(server),
                         stateKey: server.state,
+                        blockStart: server.span && server.span.start != null ? server.span.start : Infinity,
                         connectionType: connectionType
                     });
                 }
