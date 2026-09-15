@@ -513,16 +513,6 @@
             font-weight: bold;
         }
 
-        /* Role column (VPK) */
-        .role-set {
-            color: #2e6fb4;
-            font-weight: bold;
-        }
-
-        .role-none {
-            color: #aaa;
-        }
-
         /* Throughput colors */
         .throughput-high {
             color: green;
@@ -1036,21 +1026,6 @@
                 ? `${name} [${server.span.start}:${server.span.end}]` : name;
         };
 
-        // A node announces a role only when the service behind it answers
-        // its local health check, so absence means "not advertising", not
-        // "not running". Bobs never advertise: nothing on a Bob serves a
-        // health endpoint, so a remote peer is told of Eves only.
-        const ROLE_LABELS = { eve: 'Eve', bob: 'Bob', both: 'Eve + Bob' };
-        const roleLabel = (cap) => {
-            if (!cap || typeof cap !== 'object') return '';
-            const mode = String(cap.mode || '').toLowerCase();
-            return ROLE_LABELS[mode] || (mode ? mode : 'Yes');
-        };
-        const vpkRole = (server) => roleLabel(((server.span || {}).server_info || {}).vpk);
-        const roleCell = (label) => label
-            ? `<span class="role-set">${label}</span>`
-            : '<span class="role-none">—</span>';
-
         // Every view draws from `peers`: each peer the observer identified
         // over kad or found named in the DHT, serving or not — shaped like the
         // v1 server rows the helpers above read. A map-server without `peers`
@@ -1073,7 +1048,6 @@
                                 version: p.version,
                                 throughput: p.throughput,
                                 using_relay: p.using_relay,
-                                vpk: p.vpk,
                                 shard_loading: p.shard_loading,
                                 trust_attestations: p.trust_attestations,
                             },
@@ -1283,7 +1257,6 @@
             return `<div class="site-node">
                 <b>Model:</b> ${modelLabel(server, report.name)}<br>
                 <b>Sharding:</b> <span class="${statusClass(server.state)}">${serverStatus(server)}</span><br>
-                <b>VPK:</b> ${roleCell(vpkRole(server))}<br>
                 <b>Public Name:</b> ${publicName}<br>
                 <b>Version:</b> ${version}<br>
                 <b>Connection:</b> <span style="color:${connectionTypeColor}; font-weight:bold;">${connectionType}</span><br>
@@ -1828,7 +1801,7 @@
                         location: locationInfo,
                         throughput: throughput ? throughput.toFixed(2) : "N/A",
                         connectionType: connectionType,
-                        title: `Model: ${modelLabel(server, modelName)}<br>Sharding: ${serverStatus(server)}<br>VPK: ${vpkRole(server) || "—"}<br>Location: ${locationInfo}`,
+                        title: `Model: ${modelLabel(server, modelName)}<br>Sharding: ${serverStatus(server)}<br>Location: ${locationInfo}`,
                         borderWidth: 2,
                         level: 2,
                         // Different shape based on connection type
