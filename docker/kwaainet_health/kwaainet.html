@@ -513,16 +513,6 @@
             font-weight: bold;
         }
 
-        /* Role column (VPK) */
-        .role-set {
-            color: #2e6fb4;
-            font-weight: bold;
-        }
-
-        .role-none {
-            color: #aaa;
-        }
-
         /* Throughput colors */
         .throughput-high {
             color: green;
@@ -611,7 +601,6 @@
                             <th data-sort="model">Model <span class="sort-indicator"></span></th>
                             <th data-sort="state">Sharding <span class="sort-indicator"></span></th>
                             <th data-sort="throughput">Tok/sec <span class="sort-indicator"></span></th>
-                            <th data-sort="vpk">VPK <span class="sort-indicator"></span></th>
                         </tr>
                     </thead>
                     <tbody>
@@ -1037,21 +1026,6 @@
                 ? `${name} [${server.span.start}:${server.span.end}]` : name;
         };
 
-        // A node announces a role only when the service behind it answers
-        // its local health check, so absence means "not advertising", not
-        // "not running". Bobs never advertise: nothing on a Bob serves a
-        // health endpoint, so a remote peer is told of Eves only.
-        const ROLE_LABELS = { eve: 'Eve', bob: 'Bob', both: 'Eve + Bob' };
-        const roleLabel = (cap) => {
-            if (!cap || typeof cap !== 'object') return '';
-            const mode = String(cap.mode || '').toLowerCase();
-            return ROLE_LABELS[mode] || (mode ? mode : 'Yes');
-        };
-        const vpkRole = (server) => roleLabel(((server.span || {}).server_info || {}).vpk);
-        const roleCell = (label) => label
-            ? `<span class="role-set">${label}</span>`
-            : '<span class="role-none">—</span>';
-
         // Every view draws from `peers`: each peer the observer identified
         // over kad or found named in the DHT, serving or not — shaped like the
         // v1 server rows the helpers above read. A map-server without `peers`
@@ -1074,7 +1048,6 @@
                                 version: p.version,
                                 throughput: p.throughput,
                                 using_relay: p.using_relay,
-                                vpk: p.vpk,
                                 shard_loading: p.shard_loading,
                                 trust_attestations: p.trust_attestations,
                             },
@@ -1284,7 +1257,6 @@
             return `<div class="site-node">
                 <b>Model:</b> ${modelLabel(server, report.name)}<br>
                 <b>Sharding:</b> <span class="${statusClass(server.state)}">${serverStatus(server)}</span><br>
-                <b>VPK:</b> ${roleCell(vpkRole(server))}<br>
                 <b>Public Name:</b> ${publicName}<br>
                 <b>Version:</b> ${version}<br>
                 <b>Connection:</b> <span style="color:${connectionTypeColor}; font-weight:bold;">${connectionType}</span><br>
@@ -1426,11 +1398,12 @@
         let tableData = []; // Store the table data
         let currentPage = 1;
         let rowsPerPage = 15;
-        let sortField = 'model';
+        let sortField = 'state';
         let sortDirection = 'asc';
         let filteredData = [];
         
         // Sort function for table data
+        const STATE_RANK = ['Serving', 'Loading', 'Idle', 'Unreachable', 'Unannounced', 'Departed', 'Unknown'];
         function sortTableData(data, field, direction) {
             return [...data].sort((a, b) => {
                 let valueA = a[field];
@@ -1441,6 +1414,11 @@
                     valueA = valueA === 'N/A' ? -1 : parseFloat(valueA);
                     valueB = valueB === 'N/A' ? -1 : parseFloat(valueB);
                 }
+                // Sharding sorts by usefulness, not by letter.
+                if (field === 'state') {
+                    valueA = STATE_RANK.indexOf(valueA);
+                    valueB = STATE_RANK.indexOf(valueB);
+                }
                 
                 if (valueA < valueB) {
                     return direction === 'asc' ? -1 : 1;
@@ -1448,6 +1426,8 @@
                 if (valueA > valueB) {
                     return direction === 'asc' ? 1 : -1;
                 }
+                // Within a state, ranges read in block order either way up.
+                if (field === 'state') return a.blockStart - b.blockStart;
                 return 0;
             });
         }
@@ -1493,7 +1473,7 @@
             if (pageData.length === 0) {
                 const row = document.createElement('tr');
                 const cell = document.createElement('td');
-                cell.colSpan = 9;
+                cell.colSpan = 8;
                 cell.textContent = 'No data found';
                 cell.style.textAlign = 'center';
                 row.appendChild(cell);
@@ -1606,11 +1586,6 @@
                 const throughputCell = document.createElement('td');
                 throughputCell.innerHTML = getThroughputHtml(rowData.throughput);
                 row.appendChild(throughputCell);
-
-                // VPK role
-                const vpkCell = document.createElement('td');
-                vpkCell.innerHTML = roleCell(rowData.vpk);
-                row.appendChild(vpkCell);
 
                 tableBody.appendChild(row);
             });
@@ -1834,7 +1809,7 @@
                         location: locationInfo,
                         throughput: throughput ? throughput.toFixed(2) : "N/A",
                         connectionType: connectionType,
-                        title: `Model: ${modelLabel(server, modelName)}<br>Sharding: ${serverStatus(server)}<br>VPK: ${vpkRole(server) || "—"}<br>Location: ${locationInfo}`,
+                        title: `Model: ${modelLabel(server, modelName)}<br>Sharding: ${serverStatus(server)}<br>Location: ${locationInfo}`,
                         borderWidth: 2,
                         level: 2,
                         // Different shape based on connection type
@@ -1994,13 +1969,14 @@
                         publicName: publicName,
                         version: version,
                         peerId: server.peer_id || "",
-                        throughput: throughput ? throughput.toFixed(2) : "N/A",
+                        // The record's rate is a placeholder unless it is serving.
+                        throughput: server.state === 'online' && throughput ? throughput.toFixed(2) : "N/A",
                         // The label is the row's value so the Status column
                         // sorts and the search box matches on what is displayed;
                         // the wire value rides along for the colour class.
                         state: serverStatus(server),
                         stateKey: server.state,
-                        vpk: vpkRole(server),
+                        blockStart: server.span && server.span.start != null ? server.span.start : Infinity,
                         connectionType: connectionType
                     });
                 }
