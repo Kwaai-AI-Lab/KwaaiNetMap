@@ -611,7 +611,6 @@
                             <th data-sort="model">Model <span class="sort-indicator"></span></th>
                             <th data-sort="state">Sharding <span class="sort-indicator"></span></th>
                             <th data-sort="throughput">Tok/sec <span class="sort-indicator"></span></th>
-                            <th data-sort="vpk">VPK <span class="sort-indicator"></span></th>
                         </tr>
                     </thead>
                     <tbody>
@@ -1493,7 +1492,7 @@
             if (pageData.length === 0) {
                 const row = document.createElement('tr');
                 const cell = document.createElement('td');
-                cell.colSpan = 9;
+                cell.colSpan = 8;
                 cell.textContent = 'No data found';
                 cell.style.textAlign = 'center';
                 row.appendChild(cell);
@@ -1606,11 +1605,6 @@
                 const throughputCell = document.createElement('td');
                 throughputCell.innerHTML = getThroughputHtml(rowData.throughput);
                 row.appendChild(throughputCell);
-
-                // VPK role
-                const vpkCell = document.createElement('td');
-                vpkCell.innerHTML = roleCell(rowData.vpk);
-                row.appendChild(vpkCell);
 
                 tableBody.appendChild(row);
             });
@@ -2000,7 +1994,6 @@
                         // the wire value rides along for the colour class.
                         state: serverStatus(server),
                         stateKey: server.state,
-                        vpk: vpkRole(server),
                         connectionType: connectionType
                     });
                 }
