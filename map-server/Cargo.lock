@@ -1528,8 +1528,8 @@ dependencies = [
 
 [[package]]
 name = "kwaai-hivemind-dht"
-version = "0.7.0"
-source = "git+https://github.com/Kwaai-AI-Lab/KwaaiNet?tag=v0.7.0#e66dd62273f367fbee4a18ad4cf4607bbc489926"
+version = "0.7.3"
+source = "git+https://github.com/Kwaai-AI-Lab/KwaaiNet?rev=9d5b8889#9d5b8889224278357d122ff9607dc727506c0f38"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1550,13 +1550,14 @@ dependencies = [
 
 [[package]]
 name = "kwaai-p2p"
-version = "0.7.0"
-source = "git+https://github.com/Kwaai-AI-Lab/KwaaiNet?tag=v0.7.0#e66dd62273f367fbee4a18ad4cf4607bbc489926"
+version = "0.7.3"
+source = "git+https://github.com/Kwaai-AI-Lab/KwaaiNet?rev=9d5b8889#9d5b8889224278357d122ff9607dc727506c0f38"
 dependencies = [
  "anyhow",
  "async-trait",
  "bincode",
  "futures",
+ "if-addrs",
  "kwaai-hivemind-dht",
  "libp2p",
  "prost 0.12.6",

@@ -55,6 +55,9 @@ pub async fn start(bootstrap_peers: &[String], only_global_ips: bool) -> Result<
         // The published crate (0.6.8) still calls the field by its old name
         // and defaults it lenient; set it explicitly so a public map is strict.
         require_global_ips: only_global_ips,
+        // An observer on a server: nothing to discover on its LAN, and no
+        // multicast from the host.
+        enable_mdns: false,
         ..NetworkConfig::default()
     };
 
