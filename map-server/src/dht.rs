@@ -109,6 +109,9 @@ pub fn decode_server_info(bytes: &[u8]) -> Option<ServerInfo> {
             "shard_loading" => info.shard_loading = v.as_bool(),
             "cache_tokens_left" => info.cache_tokens_left = v.as_i64(),
             "peer_id" => info.peer_id = s(v),
+            "addrs_signed" => {
+                info.addrs_signed = v.as_slice().map(<[u8]>::to_vec).unwrap_or_default()
+            }
             "vpk" => info.vpk = serde_json::to_value(v).ok(),
             "trust_attestations" => {
                 info.trust_attestations = v.as_array().map(Vec::len).unwrap_or(0)
@@ -214,6 +217,38 @@ mod tests {
             ]),
         );
         assert_eq!(decode_server_info(&without).unwrap().shard_loading, None);
+    }
+
+    #[test]
+    fn the_signed_address_record_is_carried_through_and_absent_is_empty() {
+        let with = ext(
+            64,
+            Value::Array(vec![
+                Value::from(2),
+                Value::from(0.0),
+                Value::Map(vec![(
+                    Value::from("addrs_signed"),
+                    Value::Binary(vec![1, 2, 3]),
+                )]),
+            ]),
+        );
+        assert_eq!(
+            decode_server_info(&with).unwrap().addrs_signed,
+            vec![1, 2, 3]
+        );
+
+        let without = ext(
+            64,
+            Value::Array(vec![
+                Value::from(2),
+                Value::from(0.0),
+                Value::Map(vec![(Value::from("start_block"), Value::from(0))]),
+            ]),
+        );
+        assert!(decode_server_info(&without)
+            .unwrap()
+            .addrs_signed
+            .is_empty());
     }
 
     #[test]
