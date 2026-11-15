@@ -53,6 +53,12 @@ pub struct ServerInfo {
     /// carries its own id in the field map. Internal — not part of the v1 shape.
     #[serde(skip)]
     pub peer_id: Option<String>,
+    /// The node's signed peer record (`addrs_signed`), still encoded: a
+    /// protobuf `SignedEnvelope` naming the multiaddrs it can be dialed on.
+    /// The crawl verifies it with `kwaai_p2p::verified_addrs` before dialing.
+    /// Internal — not part of the v1 shape.
+    #[serde(skip)]
+    pub addrs_signed: Vec<u8>,
 }
 
 /// Geolocation of one address, in ip-api.com's field names.

@@ -17,7 +17,7 @@ use anyhow::Result;
 use chrono::Utc;
 use kwaai_hivemind_dht::protocol::{FindRequest, FindResponse, NodeInfo, RequestAuthInfo};
 use kwaai_hivemind_dht::PROTOCOL_FIND;
-use kwaai_p2p::{Direction, NetworkHandle, PeerId};
+use kwaai_p2p::{verified_addrs, Direction, Multiaddr, NetworkHandle, PeerId};
 use prost::Message as _;
 use sha1::{Digest, Sha1};
 use tracing::{debug, info, warn};
@@ -194,7 +194,13 @@ async fn crawl_once(
         .chain(kad_known)
         .filter(|id| !exclude.contains(id))
         .collect();
-    let dial_errors = connect_discovered_peers(handle, &discovered).await;
+    let record_addrs = record_dial_addrs(&per_model, &capability_peers);
+    debug!(
+        "{} of {} peer(s) published a verified address record",
+        record_addrs.len(),
+        discovered.len()
+    );
+    let dial_errors = connect_discovered_peers(handle, &discovered, &record_addrs).await;
 
     let addrs = observed_addrs(handle).await;
     let flat: Vec<String> = addrs
@@ -517,6 +523,46 @@ const PEER_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 /// Dials run together; the pass costs one timeout, not one per unreachable peer.
 const PEER_DIAL_CONCURRENCY: usize = 8;
 
+/// Every peer's verified dial addresses, from the signed records its
+/// announcements carried this crawl: block records under every model, and the
+/// capability registries.
+///
+/// The record is checked by `kwaai_p2p::verified_addrs` against the peer id
+/// the announcement is filed under, so an address list the peer itself did
+/// not sign is dropped. Any peer can `STORE` under another's subkey, and an
+/// unsigned list would let it point the crawler's dials anywhere. A peer seen
+/// in several records gets the union, in first-seen order.
+fn record_dial_addrs(
+    per_model: &BTreeMap<String, HashMap<String, PeerModelEntry>>,
+    capability_peers: &HashMap<String, ServerInfo>,
+) -> HashMap<String, Vec<Multiaddr>> {
+    let infos = per_model
+        .values()
+        .flat_map(|peers| peers.iter().map(|(id, e)| (id, &e.info)))
+        .chain(capability_peers.iter());
+
+    let mut out: HashMap<String, Vec<Multiaddr>> = HashMap::new();
+    for (id, info) in infos {
+        if info.addrs_signed.is_empty() {
+            continue;
+        }
+        let Ok(peer) = id.parse::<PeerId>() else {
+            continue;
+        };
+        let verified = verified_addrs(&info.addrs_signed, peer);
+        if verified.is_empty() {
+            continue;
+        }
+        let addrs = out.entry(id.clone()).or_default();
+        for addr in verified {
+            if !addrs.contains(&addr) {
+                addrs.push(addr);
+            }
+        }
+    }
+    out
+}
+
 /// Dial every discovered peer, so `observed_addrs` below has connections to
 /// read addresses from, and return why each failed dial failed.
 ///
@@ -524,9 +570,22 @@ const PEER_DIAL_CONCURRENCY: usize = 8;
 /// a live connection. v1 dialled every server each pass as its reachability
 /// probe and read `list_peers` afterwards — its locations were a side effect
 /// of that probe, and without an equivalent every row is "Location Unknown".
-/// The bare `/p2p/<id>` dial is the routed path: Kademlia supplies whatever
-/// addresses the walk above just taught it. Failures leave the peer unlocated,
-/// as on v1, and connections are left for the swarm's idle timeout to reap.
+/// A peer that published a signed address record is dialed from it, through
+/// `connect_peer_with_addrs`. One that did not — a binary older than the
+/// record, or a record that failed verification — gets the bare `/p2p/<id>`
+/// dial, the routed path: Kademlia supplies whatever addresses the walk above
+/// just taught it.
+///
+/// The record is not optional for a relayed peer. rust-libp2p answers
+/// `FIND_NODE` from its k-buckets alone, so a peer is findable only while it
+/// holds a slot in the right bucket on a peer the walk reaches. A relayed node
+/// that misses fails every crawl with `peer not found in DHT (no addresses)`
+/// while its own announcements land fine. The circuit address it needs is one
+/// a dialer cannot guess, which is why every announce carries the record and
+/// dispatch in `kwaai-cli` already dials from it.
+///
+/// Failures leave the peer unlocated, as on v1, and connections are left for
+/// the swarm's idle timeout to reap.
 ///
 /// The failures are also the only real connectivity signal in the crawl, which
 /// is what `reachability_issues` reports — hence the return value rather than
@@ -535,24 +594,42 @@ const PEER_DIAL_CONCURRENCY: usize = 8;
 async fn connect_discovered_peers(
     handle: &NetworkHandle,
     peer_ids: &BTreeSet<String>,
+    record_addrs: &HashMap<String, Vec<Multiaddr>>,
 ) -> BTreeMap<String, String> {
     use futures::StreamExt as _;
 
     let ours = handle.local_peer_id();
-    // Owned ids, not borrows of the set: an async block capturing `&String`
-    // from the iterator cannot satisfy the higher-ranked bound `buffer_unordered`
-    // needs.
-    let targets: Vec<String> = peer_ids.iter().filter(|id| **id != ours).cloned().collect();
+    // Owned ids and addresses, not borrows: an async block capturing `&String`
+    // from the iterator cannot satisfy the higher-ranked bound
+    // `buffer_unordered` needs.
+    let targets: Vec<(String, Vec<Multiaddr>)> = peer_ids
+        .iter()
+        .filter(|id| **id != ours)
+        .map(|id| {
+            (
+                id.clone(),
+                record_addrs.get(id).cloned().unwrap_or_default(),
+            )
+        })
+        .collect();
     futures::stream::iter(targets)
-        .map(|peer_id| async move {
-            let addr = format!("/p2p/{peer_id}");
-            let err =
-                match tokio::time::timeout(PEER_DIAL_TIMEOUT, handle.connect_peer(&addr)).await {
-                    Ok(Ok(_)) => return None,
-                    Ok(Err(e)) => e.to_string(),
-                    Err(_) => format!("dial timed out after {}s", PEER_DIAL_TIMEOUT.as_secs()),
-                };
-            debug!("location dial {peer_id}: {err}");
+        .map(|(peer_id, addrs)| async move {
+            let via = if addrs.is_empty() { "kad" } else { "record" };
+            let dial = async {
+                match (addrs.is_empty(), peer_id.parse::<PeerId>()) {
+                    (false, Ok(peer)) => handle.connect_peer_with_addrs(peer, addrs).await,
+                    _ => handle.connect_peer(&format!("/p2p/{peer_id}")).await,
+                }
+            };
+            let err = match tokio::time::timeout(PEER_DIAL_TIMEOUT, dial).await {
+                Ok(Ok(_)) => {
+                    debug!("location dial {peer_id} via {via}: ok");
+                    return None;
+                }
+                Ok(Err(e)) => e.to_string(),
+                Err(_) => format!("dial timed out after {}s", PEER_DIAL_TIMEOUT.as_secs()),
+            };
+            debug!("location dial {peer_id} via {via}: {err}");
             Some((peer_id, err))
         })
         .buffer_unordered(PEER_DIAL_CONCURRENCY)
@@ -1058,6 +1135,118 @@ fn tier_from_vc_count(count: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libp2p::identity::Keypair;
+
+    /// A signed address record for `key`, exactly as a node publishes one.
+    fn envelope(key: &Keypair, addrs: &[&str]) -> Vec<u8> {
+        let addrs = addrs
+            .iter()
+            .map(|a| a.parse().expect("a valid addr"))
+            .collect();
+        libp2p::core::PeerRecord::new_interop(key, addrs)
+            .expect("signs")
+            .into_signed_envelope()
+            .into_protobuf_encoding()
+    }
+
+    fn announced(addrs_signed: Vec<u8>) -> ServerInfo {
+        ServerInfo {
+            state: "online".into(),
+            addrs_signed,
+            ..Default::default()
+        }
+    }
+
+    const RELAYED: &str =
+        "/ip4/18.223.225.231/tcp/8000/p2p/QmQhRuheeCLEsVD3RsnknM75gPDDqxAb8DhnWgro7KhaJc/p2p-circuit";
+    const DIRECT: &str = "/ip4/203.0.113.7/tcp/8080";
+
+    /// metro-win on 2026-11-15: relayed, absent from every k-bucket the walk
+    /// reached, and so `peer not found in DHT (no addresses)` on every crawl
+    /// while its record named the circuit it could be reached on.
+    #[test]
+    fn a_relayed_peer_is_dialed_from_its_signed_record() {
+        let key = Keypair::generate_ed25519();
+        let id = key.public().to_peer_id().to_base58();
+        let mut per_model = BTreeMap::new();
+        per_model.insert(
+            "Llama-3-3-70B-Instruct".to_string(),
+            HashMap::from([(
+                id.clone(),
+                PeerModelEntry {
+                    blocks: BTreeSet::from([8]),
+                    info: announced(envelope(&key, &[RELAYED])),
+                },
+            )]),
+        );
+
+        let addrs = record_dial_addrs(&per_model, &HashMap::new());
+        assert_eq!(
+            addrs
+                .get(&id)
+                .map(|a| a.iter().map(ToString::to_string).collect::<Vec<_>>()),
+            Some(vec![RELAYED.to_string()])
+        );
+    }
+
+    /// Anyone can STORE under another peer's subkey. A list signed by some
+    /// other key must not steer the crawler's dial to that peer.
+    #[test]
+    fn a_record_signed_by_another_key_is_dropped() {
+        let victim = Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+            .to_base58();
+        let attacker = Keypair::generate_ed25519();
+        let caps = HashMap::from([(victim.clone(), announced(envelope(&attacker, &[DIRECT])))]);
+
+        assert!(!record_dial_addrs(&BTreeMap::new(), &caps).contains_key(&victim));
+    }
+
+    /// A peer in a block record and a registry gets each address once.
+    #[test]
+    fn addresses_from_several_records_are_merged_without_duplicates() {
+        let key = Keypair::generate_ed25519();
+        let id = key.public().to_peer_id().to_base58();
+        let mut per_model = BTreeMap::new();
+        per_model.insert(
+            "m".to_string(),
+            HashMap::from([(
+                id.clone(),
+                PeerModelEntry {
+                    blocks: BTreeSet::from([0]),
+                    info: announced(envelope(&key, &[RELAYED])),
+                },
+            )]),
+        );
+        let caps = HashMap::from([(id.clone(), announced(envelope(&key, &[RELAYED, DIRECT])))]);
+
+        let got: Vec<String> = record_dial_addrs(&per_model, &caps)[&id]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(got, vec![RELAYED.to_string(), DIRECT.to_string()]);
+    }
+
+    /// No record, or one that does not decode: no entry, so the dial falls
+    /// back to the bare `/p2p/<id>` walk exactly as before.
+    #[test]
+    fn a_peer_without_a_usable_record_has_no_entry() {
+        let a = Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+            .to_base58();
+        let b = Keypair::generate_ed25519()
+            .public()
+            .to_peer_id()
+            .to_base58();
+        let caps = HashMap::from([
+            (a.clone(), announced(Vec::new())),
+            (b.clone(), announced(vec![0xde, 0xad, 0xbe, 0xef])),
+        ]);
+
+        assert!(record_dial_addrs(&BTreeMap::new(), &caps).is_empty());
+    }
 
     fn conn(addr: &str, direction: Direction, via: Option<&str>, dcutr: bool) -> Conn {
         Conn {
